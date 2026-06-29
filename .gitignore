@@ -1,1 +1,3 @@
 .aider*
+.aws-sam/
+venv/

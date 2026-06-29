@@ -22,7 +22,7 @@ Resources:
     Type: AWS::Serverless::Function                                                                                   
     Properties:                                                                                                       
       CodeUri: src/router/                                                                                            
-      Handler: app.handler                                                                                            
+      Handler: lambda_function.handler                                                                                            
       Policies:                                                                                                       
         - StepFunctionsExecutionPolicy:                                                                               
             StateMachineName: !GetAtt IncidentResponseStateMachine.Name                                               
@@ -34,7 +34,7 @@ Resources:
     Type: AWS::Serverless::Function                                                                                   
     Properties:                                                                                                       
       CodeUri: src/enrich/                                                                                            
-      Handler: app.handler                                                                                            
+      Handler: lambda_function.handler                                                                                            
       Policies:                                                                                                       
         # For production, it is better to use a more restrictive custom policy                                        
         # instead of the AWS managed policy.                                                                          
@@ -44,7 +44,7 @@ Resources:
     Type: AWS::Serverless::Function                                                                                   
     Properties:                                                                                                       
       CodeUri: src/isolate/                                                                                           
-      Handler: app.handler                                                                                            
+      Handler: lambda_function.handler                                                                                            
       Policies:                                                                                                       
         - Statement:                                                                                                  
           - Effect: Allow                                                                                             
@@ -60,7 +60,7 @@ Resources:
     Type: AWS::Serverless::Function                                                                                   
     Properties:                                                                                                       
       CodeUri: src/alert/                                                                                             
-      Handler: app.handler                                                                                            
+      Handler: lambda_function.handler                                                                                            
       Policies:                                                                                                       
         - SNSPublishMessagePolicy:                                                                                    
             TopicName: !GetAtt AlertsSNSTopic.TopicName                                                               
