@@ -1,155 +1,156 @@
-AWSTemplateFormatVersion: '2010-09-09'                                                                                
-Transform: AWS::Serverless-2016-10-31                                                                                 
-Description: >                                                                                                        
-  incident-response-pipeline                                                                                          
-  SAM template for a serverless incident response pipeline for GuardDuty findings.                                    
-                                                                                                                      
-Globals:                                                                                                              
-  Function:                                                                                                           
-    Timeout: 30                                                                                                       
-    MemorySize: 128                                                                                                   
-    Runtime: python3.9                                                                                                
-    Architectures:                                                                                                    
-      - x86_64                                                                                                        
-                                                                                                                      
-Resources:                                                                                                            
-  AlertsSNSTopic:                                                                                                     
-    Type: AWS::SNS::Topic                                                                                             
-    Properties:                                                                                                       
-      DisplayName: Incident Response Alerts                                                                           
-                                                                                                                      
-  RouterFunction:                                                                                                     
-    Type: AWS::Serverless::Function                                                                                   
-    Properties:                                                                                                       
-      CodeUri: src/router/                                                                                            
-      Handler: lambda_function.handler                                                                                            
-      Policies:                                                                                                       
-        - StepFunctionsExecutionPolicy:                                                                               
-            StateMachineName: !GetAtt IncidentResponseStateMachine.Name                                               
-      Environment:                                                                                                    
-        Variables:                                                                                                    
-          SFN_STATE_MACHINE_ARN: !Ref IncidentResponseStateMachine                                                    
-                                                                                                                      
-  EnrichFunction:                                                                                                     
-    Type: AWS::Serverless::Function                                                                                   
-    Properties:                                                                                                       
-      CodeUri: src/enrich/                                                                                            
-      Handler: lambda_function.handler                                                                                            
-      Policies:                                                                                                       
-        # For production, it is better to use a more restrictive custom policy                                        
-        # instead of the AWS managed policy.                                                                          
-        - AmazonEC2ReadOnlyAccess                                                                                     
-                                                                                                                      
-  IsolateFunction:                                                                                                    
-    Type: AWS::Serverless::Function                                                                                   
-    Properties:                                                                                                       
-      CodeUri: src/isolate/                                                                                           
-      Handler: lambda_function.handler                                                                                            
-      Policies:                                                                                                       
-        - Statement:                                                                                                  
-          - Effect: Allow                                                                                             
-            Action:                                                                                                   
-              - ec2:DescribeInstances                                                                                 
-              - ec2:DescribeSecurityGroups                                                                            
-              - ec2:CreateSecurityGroup                                                                               
-              - ec2:ModifyInstanceAttribute                                                                           
-            # For production, this should be scoped down to specific resources if possible.                           
-            Resource: "*"                                                                                             
-                                                                                                                      
-  AlertFunction:                                                                                                      
-    Type: AWS::Serverless::Function                                                                                   
-    Properties:                                                                                                       
-      CodeUri: src/alert/                                                                                             
-      Handler: lambda_function.handler                                                                                            
-      Policies:                                                                                                       
-        - SNSPublishMessagePolicy:                                                                                    
-            TopicName: !GetAtt AlertsSNSTopic.TopicName                                                               
-      Environment:                                                                                                    
-        Variables:                                                                                                    
-          SNS_TOPIC_ARN: !Ref AlertsSNSTopic                                                                          
-                                                                                                                      
-  IncidentResponseStateMachine:                                                                                       
-    Type: AWS::Serverless::StateMachine                                                                               
-    Properties:                                                                                                       
-      Definition:                                                                                                     
-        Comment: "Orchestrates incident response for GuardDuty findings on EC2 instances"                             
-        StartAt: EnrichFinding                                                                                        
-        States:                                                                                                       
-          EnrichFinding:                                                                                              
-            Type: Task                                                                                                
-            Resource: !GetAtt EnrichFunction.Arn                                                                      
-            Next: IsProductionCheck                                                                                   
-            Catch:                                                                                                    
-              - ErrorEquals: ["States.ALL"]                                                                           
-                Next: FailState                                                                                       
-          IsProductionCheck:                                                                                          
-            Type: Choice                                                                                              
-            Choices:                                                                                                  
-              - Variable: "$.IsProduction"                                                                            
-                BooleanEquals: true                                                                                   
-                Next: IsolateAndAlert                                                                                 
-            Default: NonProdAlert                                                                                     
-          IsolateAndAlert:                                                                                            
-            Type: Parallel                                                                                            
-            Branches:                                                                                                 
-              - StartAt: IsolateInstance                                                                              
-                States:                                                                                               
-                  IsolateInstance:                                                                                    
-                    Type: Task                                                                                        
-                    Resource: !GetAtt IsolateFunction.Arn                                                             
-                    End: true                                                                                         
-              - StartAt: SendAlert                                                                                    
-                States:                                                                                               
-                  SendAlert:                                                                                          
-                    Type: Task                                                                                        
-                    Resource: !GetAtt AlertFunction.Arn                                                               
-                    End: true                                                                                         
-            Next: SuccessState                                                                                        
-          NonProdAlert:                                                                                               
-            Type: Task                                                                                                
-            Resource: !GetAtt AlertFunction.Arn                                                                       
-            Next: SuccessState                                                                                        
-          SuccessState:                                                                                               
-            Type: Succeed                                                                                             
-          FailState:                                                                                                  
-            Type: Fail                                                                                                
-      Policies:                                                                                                       
-        - LambdaInvokePolicy:                                                                                         
-            FunctionName: !Ref EnrichFunction                                                                         
-        - LambdaInvokePolicy:                                                                                         
-            FunctionName: !Ref IsolateFunction                                                                        
-        - LambdaInvokePolicy:                                                                                         
-            FunctionName: !Ref AlertFunction                                                                          
-                                                                                                                      
-  GuardDutyFindingRule:                                                                                               
-    Type: AWS::Events::Rule                                                                                           
-    Properties:                                                                                                       
-      Description: "Rule to capture GuardDuty EC2 findings and trigger the router"                                    
-      EventPattern:                                                                                                   
-        source:                                                                                                       
-          - aws.guardduty                                                                                             
-        detail-type:                                                                                                  
-          - GuardDuty Finding                                                                                         
-        detail:                                                                                                       
-          resource:                                                                                                   
-            resourceType:                                                                                             
-              - Instance                                                                                              
-      Targets:                                                                                                        
-        - Arn: !GetAtt RouterFunction.Arn                                                                             
-          Id: "RouterFunctionTarget"                                                                                  
-                                                                                                                      
-  InvokeRouterPermission:                                                                                             
-    Type: AWS::Lambda::Permission                                                                                     
-    Properties:                                                                                                       
-      FunctionName: !GetAtt RouterFunction.Arn                                                                        
-      Action: lambda:InvokeFunction                                                                                   
-      Principal: events.amazonaws.com                                                                                 
-      SourceArn: !GetAtt GuardDutyFindingRule.Arn                                                                     
-                                                                                                                      
-Outputs:                                                                                                              
-  StateMachineArn:                                                                                                    
-    Description: "ARN of the Incident Response State Machine"                                                         
-    Value: !Ref IncidentResponseStateMachine                                                                          
-  AlertsSNSTopicArn:                                                                                                  
-    Description: "ARN of the SNS topic for alerts"                                                                    
-    Value: !Ref AlertsSNSTopic 
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  incident-response-pipeline
+  SAM template for a serverless incident response pipeline for GuardDuty findings.
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+    Runtime: python3.14
+    Architectures:
+      - x86_64
+
+Resources:
+  AlertsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Incident Response Alerts
+
+  RouterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/router/
+      Handler: lambda_function.handler
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt IncidentResponseStateMachine.Name
+      Environment:
+        Variables:
+          SFN_STATE_MACHINE_ARN: !Ref IncidentResponseStateMachine
+
+  EnrichFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/enrich/
+      Handler: lambda_function.handler
+      Policies:
+        # For production, it is better to use a more restrictive custom policy
+        # instead of the AWS managed policy.
+        - AmazonEC2ReadOnlyAccess
+
+  IsolateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/isolate/
+      Handler: lambda_function.handler
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeSecurityGroups
+              - ec2:CreateSecurityGroup
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:ModifyInstanceAttribute
+            # For production, this should be scoped down to specific resources if possible.
+            Resource: "*"
+
+  AlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/alert/
+      Handler: lambda_function.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsSNSTopic.TopicName
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsSNSTopic
+
+  IncidentResponseStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Definition:
+        Comment: "Orchestrates incident response for GuardDuty findings on EC2 instances"
+        StartAt: EnrichFinding
+        States:
+          EnrichFinding:
+            Type: Task
+            Resource: !GetAtt EnrichFunction.Arn
+            Next: IsProductionCheck
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: FailState
+          IsProductionCheck:
+            Type: Choice
+            Choices:
+              - Variable: "$.IsProduction"
+                BooleanEquals: true
+                Next: IsolateAndAlert
+            Default: NonProdAlert
+          IsolateAndAlert:
+            Type: Parallel
+            Branches:
+              - StartAt: IsolateInstance
+                States:
+                  IsolateInstance:
+                    Type: Task
+                    Resource: !GetAtt IsolateFunction.Arn
+                    End: true
+              - StartAt: SendAlert
+                States:
+                  SendAlert:
+                    Type: Task
+                    Resource: !GetAtt AlertFunction.Arn
+                    End: true
+            Next: SuccessState
+          NonProdAlert:
+            Type: Task
+            Resource: !GetAtt AlertFunction.Arn
+            Next: SuccessState
+          SuccessState:
+            Type: Succeed
+          FailState:
+            Type: Fail
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref EnrichFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IsolateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AlertFunction
+
+  GuardDutyFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to capture GuardDuty EC2 findings and trigger the router"
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          resource:
+            resourceType:
+              - Instance
+      Targets:
+        - Arn: !GetAtt RouterFunction.Arn
+          Id: "RouterFunctionTarget"
+
+  InvokeRouterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RouterFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyFindingRule.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: "ARN of the Incident Response State Machine"
+    Value: !Ref IncidentResponseStateMachine
+  AlertsSNSTopicArn:
+    Description: "ARN of the SNS topic for alerts"
+    Value: !Ref AlertsSNSTopic
