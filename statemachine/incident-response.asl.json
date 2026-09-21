@@ -122,7 +122,7 @@
         {
           "Variable": "$.decision.decision",
           "StringEquals": "APPROVAL_REQUIRED",
-          "Next": "NotifyApprovalRequired"
+          "Next": "AwaitApproval"
         }
       ],
       "Default": "NotifyOnly"
@@ -159,12 +159,62 @@
       ],
       "End": true
     },
-    "NotifyApprovalRequired": {
+    "AwaitApproval": {
       "Type": "Task",
-      "Comment": "Phase 4 turns this into a .waitForTaskToken callback. For now it only notifies; nothing is contained.",
+      "Comment": "Pauses until a human calls SendTaskSuccess or SendTaskFailure. Both are IAM-authorised, so possession of the token is not consent.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${AlertFunctionArn}",
+        "Payload": {
+          "notifyKind": "APPROVAL_REQUIRED",
+          "taskToken.$": "$$.Task.Token",
+          "executionArn.$": "$$.Execution.Id",
+          "incidentId.$": "$.incidentId",
+          "findingId.$": "$.findingId",
+          "accountId.$": "$.accountId",
+          "region.$": "$.region",
+          "finding.$": "$.finding",
+          "enrichment.$": "$.enrichment",
+          "decision.$": "$.decision"
+        }
+      },
+      "ResultPath": "$.approval",
+      "TimeoutSecondsPath": "$.decision.approvalTimeoutSeconds",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ApprovalTimedOut"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyApprovalDeclined"
+        }
+      ],
+      "Next": "BeginContainment"
+    },
+    "ApprovalTimedOut": {
+      "Type": "Choice",
+      "Comment": "Nobody answering is not consent. In production the default is to escalate rather than contain.",
+      "Choices": [
+        {
+          "Variable": "$.decision.approvalTimeoutAction",
+          "StringEquals": "Contain",
+          "Next": "BeginContainment"
+        }
+      ],
+      "Default": "NotifyApprovalTimedOut"
+    },
+    "NotifyApprovalTimedOut": {
+      "Type": "Task",
       "Resource": "${AlertFunctionArn}",
       "Parameters": {
-        "notifyKind": "APPROVAL_REQUIRED",
+        "notifyKind": "APPROVAL_TIMED_OUT",
         "incidentId.$": "$.incidentId",
         "findingId.$": "$.findingId",
         "accountId.$": "$.accountId",
@@ -185,7 +235,40 @@
           "BackoffRate": 2
         }
       ],
-      "End": true
+      "Next": "ApprovalNotGranted"
+    },
+    "NotifyApprovalDeclined": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "APPROVAL_DENIED",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "decision.$": "$.decision",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "ApprovalNotGranted"
+    },
+    "ApprovalNotGranted": {
+      "Type": "Fail",
+      "Error": "ApprovalNotGranted",
+      "Cause": "Containment was not approved, or nobody answered. Nothing was changed."
     },
     "BeginContainment": {
       "Type": "Pass",

@@ -34,6 +34,7 @@ FUNCTION_LOGICAL_IDS = [
     "CredContainFunction",
     "IdentityFunction",
     "ImdsFunction",
+    "ReleaseFunction",
     "AlertFunction",
 ]
 
@@ -258,8 +259,9 @@ def test_incidents_table_is_encrypted_recoverable_and_retained(transformed):
 
 def test_the_state_machine_can_invoke_exactly_the_states_it_uses(transformed):
     machines = resources_of(transformed, "AWS::StepFunctions::StateMachine")
-    assert len(machines) == 1
-    role_name = list(machines.values())[0]["Properties"]["RoleArn"]["Fn::GetAtt"][0]
+    assert len(machines) == 2, "the response machine and the release machine"
+    body = [m for name, m in machines.items() if "Release" not in name][0]
+    role_name = body["Properties"]["RoleArn"]["Fn::GetAtt"][0]
 
     invokable = set()
     for policy in transformed["Resources"][role_name]["Properties"]["Policies"]:
@@ -343,3 +345,70 @@ def test_snapshot_tagging_is_scoped_to_creation(transformed):
     for statement in statements_for(transformed, "NetIsolateFunction"):
         if "ec2:CreateTags" in actions_of(statement):
             assert statement["Condition"]["StringEquals"]["ec2:CreateAction"] == "CreateSecurityGroup"
+
+
+# --- Phase 4: approval and release ------------------------------------------
+
+
+def test_release_can_remove_a_role_policy_but_never_write_one(transformed):
+    """Release undoes the credential Deny; it must not be able to create one."""
+    actions = set()
+    for statement in statements_for(transformed, "ReleaseFunction"):
+        if statement["Effect"] == "Allow":
+            actions.update(actions_of(statement))
+    assert "iam:DeleteRolePolicy" in actions
+    assert "iam:PutRolePolicy" not in actions
+    assert "iam:AttachRolePolicy" not in actions
+
+
+def test_release_also_cannot_touch_the_pipelines_own_roles(transformed):
+    denies = [
+        statement
+        for statement in statements_for(transformed, "ReleaseFunction")
+        if statement["Effect"] == "Deny" and "iam:DeleteRolePolicy" in actions_of(statement)
+    ]
+    assert denies
+    guarded = json.dumps(denies)
+    assert "aws-service-role" in guarded and "StackName" in guarded
+
+
+def test_release_cannot_create_security_groups(transformed):
+    """It only ever deletes the per-incident group it is handed."""
+    for statement in statements_for(transformed, "ReleaseFunction"):
+        if statement["Effect"] != "Allow":
+            continue
+        assert "ec2:CreateSecurityGroup" not in actions_of(statement)
+        assert "ec2:AuthorizeSecurityGroupIngress" not in actions_of(statement)
+
+
+def test_the_release_machine_can_only_invoke_release_and_alert(transformed):
+    machines = resources_of(transformed, "AWS::StepFunctions::StateMachine")
+    body = [m for name, m in machines.items() if "Release" in name][0]
+    role_name = body["Properties"]["RoleArn"]["Fn::GetAtt"][0]
+
+    invokable = set()
+    for policy in transformed["Resources"][role_name]["Properties"]["Policies"]:
+        for statement in policy["PolicyDocument"]["Statement"]:
+            if "lambda:InvokeFunction" in actions_of(statement):
+                invokable.add(json.dumps(statement["Resource"]))
+    assert len(invokable) == 2
+    joined = " ".join(invokable)
+    assert "ReleaseFunction" in joined and "AlertFunction" in joined
+    # It must not be able to reach containment.
+    for forbidden in ("CredContainFunction", "NetIsolateFunction", "EvidenceFunction"):
+        assert forbidden not in joined
+
+
+def test_nothing_in_the_stack_can_approve_its_own_requests(transformed):
+    """The approval callback is only meaningful if the pipeline cannot call it."""
+    for logical_id in FUNCTION_LOGICAL_IDS:
+        for statement in statements_for(transformed, logical_id):
+            for action in actions_of(statement):
+                assert action not in ("states:SendTaskSuccess", "states:SendTaskFailure"), (
+                    f"{logical_id} could approve its own containment requests"
+                )
+
+
+def test_the_timeout_action_cannot_be_set_to_something_unexpected(transformed):
+    allowed = transformed["Parameters"]["ApprovalTimeoutAction"]["AllowedValues"]
+    assert set(allowed) == {"Escalate", "Contain"}

@@ -90,14 +90,9 @@ def test_substitutions_are_supplied_by_the_template(path):
 # --- the safety property ----------------------------------------------------
 
 
-def test_approval_required_never_reaches_containment():
-    """An APPROVAL_REQUIRED decision must not be able to contain anything.
-
-    Until Phase 4 adds the callback, that branch only notifies. If a future
-    edit wires it into containment without a human in between, this fails.
-    """
-    document = load(ASL_DIR / "incident-response.asl.json")
-    states = document["States"]
+def test_approval_required_reaches_containment_only_through_a_human():
+    """Containment on that branch must be gated by the wait-for-token state."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
     route = states["RouteDecision"]
 
     approval_branch = [
@@ -105,12 +100,66 @@ def test_approval_required_never_reaches_containment():
         for choice in route["Choices"]
         if choice.get("StringEquals") == "APPROVAL_REQUIRED"
     ]
-    assert approval_branch, "the decision router must have an APPROVAL_REQUIRED branch"
+    assert approval_branch == ["AwaitApproval"]
 
-    for start in approval_branch:
-        assert not (reachable_from(states, start) & CONTAINMENT_STATES), (
-            f"APPROVAL_REQUIRED reaches containment via {start} with no human in between"
-        )
+    gate = states["AwaitApproval"]
+    assert gate["Resource"].endswith(".waitForTaskToken"), (
+        "the approval state must actually wait for a callback"
+    )
+    assert gate["Parameters"]["Payload"]["taskToken.$"] == "$$.Task.Token"
+
+    # Remove the gate and containment must become unreachable from this branch.
+    without_gate = {name: body for name, body in states.items() if name != "AwaitApproval"}
+    assert not (reachable_from(without_gate, "AwaitApproval") & CONTAINMENT_STATES)
+
+
+def test_an_unanswered_approval_does_not_contain_by_default():
+    """Nobody answering is not consent."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    timeout = [
+        catcher for catcher in states["AwaitApproval"]["Catch"]
+        if "States.Timeout" in catcher["ErrorEquals"]
+    ]
+    assert timeout, "the approval state must catch its own timeout"
+
+    branch = states[timeout[0]["Next"]]
+    assert branch["Type"] == "Choice"
+    # Containment is reachable only when the operator explicitly chose it.
+    contain = [c for c in branch["Choices"] if c["Next"] in CONTAINMENT_STATES
+               or c["Next"] == "BeginContainment"]
+    assert all(c.get("StringEquals") == "Contain" for c in contain)
+    assert branch["Default"] not in CONTAINMENT_STATES
+    assert branch["Default"] != "BeginContainment"
+
+
+def test_a_declined_approval_contains_nothing():
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    declined = [
+        catcher for catcher in states["AwaitApproval"]["Catch"]
+        if catcher["ErrorEquals"] == ["States.ALL"]
+    ][0]
+    assert not (reachable_from(states, declined["Next"]) & CONTAINMENT_STATES)
+
+
+def test_release_requires_an_approval_before_restoring_anything():
+    """Putting a compromised instance back on the network is never automatic."""
+    document = load(ASL_DIR / "release.asl.json")
+    states = document["States"]
+
+    gate = states["AwaitReleaseApproval"]
+    assert gate["Resource"].endswith(".waitForTaskToken")
+    assert gate["Parameters"]["Payload"]["taskToken.$"] == "$$.Task.Token"
+
+    without_gate = {n: b for n, b in states.items() if n != "AwaitReleaseApproval"}
+    assert "RestoreIncident" not in reachable_from(without_gate, document["StartAt"])
+
+
+def test_release_loads_before_it_restores():
+    states = load(ASL_DIR / "release.asl.json")["States"]
+    assert states["LoadIncident"]["Parameters"]["mode"] == "load"
+    assert states["RestoreIncident"]["Parameters"]["mode"] == "restore"
+    assert "RestoreIncident" in reachable_from(states, "LoadIncident")
+    assert "LoadIncident" not in reachable_from(states, "RestoreIncident")
 
 
 def test_ignore_and_notify_never_reach_containment():
@@ -162,11 +211,20 @@ def test_enrichment_failure_still_reaches_a_decision():
     assert fallback["Next"] == "Decide"
 
 
-def test_every_task_has_a_timeout():
+def test_no_task_can_wait_forever():
+    """A task with no timeout pins an execution open indefinitely.
+
+    The approval states use TimeoutSecondsPath rather than a literal, because
+    the value is a template parameter and ASL cannot interpolate one into a
+    numeric field.
+    """
     for path in ASL_FILES:
         for name, state in load(path)["States"].items():
-            if state["Type"] == "Task":
-                assert state.get("TimeoutSeconds"), f"{path.name}:{name} has no TimeoutSeconds"
+            if state["Type"] != "Task":
+                continue
+            assert state.get("TimeoutSeconds") or state.get("TimeoutSecondsPath"), (
+                f"{path.name}:{name} has neither TimeoutSeconds nor TimeoutSecondsPath"
+            )
 
 
 def test_containment_order_is_evidence_network_credentials_imds():

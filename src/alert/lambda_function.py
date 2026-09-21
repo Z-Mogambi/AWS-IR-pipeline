@@ -34,6 +34,10 @@ HEADLINE = {
     "PIPELINE_ERROR": "PIPELINE ERROR",
     "NOTIFY": "NOTIFY",
     "APPROVAL_REQUIRED": "APPROVAL NEEDED",
+    "APPROVAL_TIMED_OUT": "APPROVAL TIMED OUT",
+    "APPROVAL_DENIED": "APPROVAL DENIED",
+    "RELEASE_APPROVAL": "RELEASE APPROVAL NEEDED",
+    "RELEASED": "RELEASED",
     "CONTAINED": "CONTAINED",
     "CONTAINMENT_FAILED": "CONTAINMENT FAILED",
 }
@@ -122,11 +126,23 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
             f"  Error: {error.get('Error')}",
             f"  Cause: {str(error.get('Cause'))[:800]}",
         ]
-    elif kind == "APPROVAL_REQUIRED":
+    elif kind in ("APPROVAL_REQUIRED", "RELEASE_APPROVAL"):
+        lines += approval_lines(kind, event)
+    elif kind == "APPROVAL_TIMED_OUT":
         lines += [
-            "NO ACTION HAS BEEN TAKEN - a human decision is required.",
-            "  Phase 4 replaces this notice with a callback token you can approve or reject.",
+            f"NOBODY ANSWERED within {decision.get('approvalTimeoutSeconds', '?')} seconds.",
+            f"  Timeout action: {decision.get('approvalTimeoutAction', 'Escalate')}.",
+            "  Nobody answering is not consent, so in production the default is to",
+            "  escalate rather than contain. Nothing has been changed.",
         ]
+    elif kind == "APPROVAL_DENIED":
+        lines += [
+            "THE REQUEST WAS DECLINED. Nothing has been changed.",
+            f"  Reason: {str(error.get('Cause'))[:500]}",
+        ]
+    elif kind == "RELEASED":
+        lines.append("ACTIONS REVERSED")
+        lines += _action_lines(event.get("incidentId"), containment)
     elif kind == "PIPELINE_ERROR":
         lines += [
             "THE PIPELINE ITSELF FAILED - treat this finding as untriaged.",
@@ -150,6 +166,44 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
         lines.append("No containment was performed for this finding.")
 
     return "\n".join(lines)
+
+
+def approval_lines(kind, event):
+    """Render the callback as commands that require IAM credentials to run.
+
+    The task token is not, on its own, an authorisation. SendTaskSuccess is an
+    IAM-authorised API call, so an attacker who intercepts this email still
+    cannot approve anything without credentials carrying states:SendTaskSuccess
+    on this state machine. That is deliberately the whole approval mechanism:
+    no HTTP endpoint, no reply-to-approve, nothing that turns possession of the
+    token into consent.
+    """
+    token = event.get("taskToken")
+    if not token:
+        return ["NO ACTION HAS BEEN TAKEN - a human decision is required.",
+                "  (no callback token was supplied with this notification)"]
+
+    what = "release this incident" if kind == "RELEASE_APPROVAL" else "carry out the actions above"
+    return [
+        f"NO ACTION HAS BEEN TAKEN. To {what}, run:",
+        "",
+        "  aws stepfunctions send-task-success \\",
+        f"    --task-token '{token}' \\",
+        "    --task-output '{\"approved\": true, \"approver\": \"YOUR NAME\"}'",
+        "",
+        "To decline:",
+        "",
+        "  aws stepfunctions send-task-failure \\",
+        f"    --task-token '{token}' \\",
+        "    --error Declined --cause 'why you declined'",
+        "",
+        f"  Execution: {event.get('executionArn', 'unknown')}",
+        f"  This request expires in {(event.get('decision') or {}).get('approvalTimeoutSeconds', '?')}"
+        " seconds.",
+        "  Both commands require IAM credentials with states:SendTaskSuccess or",
+        "  states:SendTaskFailure on this state machine. Holding the token alone",
+        "  is not enough to approve anything.",
+    ]
 
 
 def _action_lines(incident_id, containment):

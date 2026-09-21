@@ -8,6 +8,7 @@ fixed here by a rule in a reviewable file.
 
 import json
 import logging
+import os
 
 from irlib import incidents, policy
 
@@ -15,6 +16,12 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ACTIONABLE = ("AUTO_CONTAIN", "APPROVAL_REQUIRED")
+
+# Step Functions cannot take a timeout from a template parameter directly, so
+# the value travels in the decision and the approval state reads it with
+# TimeoutSecondsPath.
+APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "3600"))
+APPROVAL_TIMEOUT_ACTION = os.environ.get("APPROVAL_TIMEOUT_ACTION", "Escalate")
 
 
 def handler(event, context):
@@ -34,6 +41,10 @@ def handler(event, context):
 
     decision = _downgrade_if_no_target(decision, targets)
     decision["environmentSource"] = enrichment.get("environmentSource")
+    decision["approvalTimeoutSeconds"] = APPROVAL_TIMEOUT_SECONDS
+    # In production the default is to escalate, not to contain: nobody
+    # answering an approval request is not consent to act.
+    decision["approvalTimeoutAction"] = APPROVAL_TIMEOUT_ACTION
 
     incidents.update_incident(
         event["incidentId"],

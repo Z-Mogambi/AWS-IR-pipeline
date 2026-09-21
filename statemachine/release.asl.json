@@ -1,0 +1,173 @@
+{
+  "Comment": "Reverse containment for one incident. Takes {\"incidentId\": \"...\"}, requires a human approval, then replays the write-ahead ledger backwards.",
+  "StartAt": "LoadIncident",
+  "States": {
+    "LoadIncident": {
+      "Type": "Task",
+      "Comment": "Read the ledger and work out what release would do, without doing any of it.",
+      "Resource": "${ReleaseFunctionArn}",
+      "Parameters": {
+        "mode": "load",
+        "incidentId.$": "$.incidentId"
+      },
+      "ResultPath": "$.plan",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "ReleaseFailed"
+        }
+      ],
+      "Next": "AwaitReleaseApproval"
+    },
+
+    "AwaitReleaseApproval": {
+      "Type": "Task",
+      "Comment": "Release is never automatic. Putting a compromised instance back on the network is a decision a person makes.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${AlertFunctionArn}",
+        "Payload": {
+          "notifyKind": "RELEASE_APPROVAL",
+          "taskToken.$": "$$.Task.Token",
+          "executionArn.$": "$$.Execution.Id",
+          "incidentId.$": "$.incidentId",
+          "plan.$": "$.plan"
+        }
+      },
+      "ResultPath": "$.approval",
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyReleaseDeclined"
+        }
+      ],
+      "Next": "RestoreIncident"
+    },
+
+    "RestoreIncident": {
+      "Type": "Task",
+      "Comment": "Replay the ledger backwards. Every step is best effort and idempotent, so a partial release can simply be re-run.",
+      "Resource": "${ReleaseFunctionArn}",
+      "Parameters": {
+        "mode": "restore",
+        "incidentId.$": "$.incidentId"
+      },
+      "ResultPath": "$.restored",
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyReleaseFailed"
+        }
+      ],
+      "Next": "NotifyReleased"
+    },
+
+    "NotifyReleased": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "RELEASED",
+        "incidentId.$": "$.incidentId",
+        "containment.$": "$.restored"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+
+    "NotifyReleaseDeclined": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "APPROVAL_DENIED",
+        "incidentId.$": "$.incidentId",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "ReleaseNotApproved"
+    },
+
+    "NotifyReleaseFailed": {
+      "Type": "Task",
+      "Comment": "A partial release leaves the incident partly contained. Say exactly which steps came back and which did not.",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "CONTAINMENT_FAILED",
+        "incidentId.$": "$.incidentId",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "ReleaseFailed"
+    },
+
+    "ReleaseNotApproved": {
+      "Type": "Fail",
+      "Error": "ReleaseNotApproved",
+      "Cause": "The release was declined or nobody answered. The incident stays contained."
+    },
+
+    "ReleaseFailed": {
+      "Type": "Fail",
+      "Error": "ReleaseFailed",
+      "Cause": "Release did not complete. See the incident record for what was restored."
+    }
+  }
+}

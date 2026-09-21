@@ -73,6 +73,23 @@ Parameters:
       is a pure Deny. Leave on: it is the check that catches an Allow reaching a
       role via the one function holding iam:PutRolePolicy.
 
+  ApprovalTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    Description: >
+      How long an approval request waits before the timeout action applies.
+
+  ApprovalTimeoutAction:
+    Type: String
+    Default: Escalate
+    AllowedValues: [Escalate, Contain]
+    Description: >
+      What to do when nobody answers. Escalate re-notifies and stops without
+      changing anything, which is the production default - nobody answering is
+      not consent. Contain proceeds, and should only be used where an
+      unattended containment is genuinely safer than waiting.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
 
@@ -266,6 +283,10 @@ Resources:
             - Effect: Allow
               Action: dynamodb:UpdateItem
               Resource: !GetAtt IncidentsTable.Arn
+      Environment:
+        Variables:
+          APPROVAL_TIMEOUT_SECONDS: !Ref ApprovalTimeoutSeconds
+          APPROVAL_TIMEOUT_ACTION: !Ref ApprovalTimeoutAction
 
   EvidenceFunction:
     Type: AWS::Serverless::Function
@@ -474,6 +495,60 @@ Resources:
                 - dynamodb:UpdateItem
               Resource: !GetAtt IncidentsTable.Arn
 
+  ReleaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/release/
+      Timeout: 300
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # Reverses the network work. No CreateSecurityGroup: release only
+              # ever deletes the per-incident group it is given.
+              Action:
+                - ec2:ModifyNetworkInterfaceAttribute
+                - ec2:DeleteSecurityGroup
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+            - Effect: Allow
+              Action:
+                - ec2:ModifyInstanceAttribute
+                - ec2:ModifyInstanceMetadataOptions
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+            - Effect: Allow
+              Action: ec2:DeleteNetworkAclEntry
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*"
+        - Statement:
+            - Effect: Allow
+              # Removes the Deny that credential containment wrote. Note this is
+              # DeleteRolePolicy, not PutRolePolicy - release can take a policy
+              # away but cannot write one.
+              Action: iam:DeleteRolePolicy
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+            - Effect: Deny
+              Action: iam:DeleteRolePolicy
+              Resource:
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-*"
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*"
+            - Effect: Allow
+              Action: iam:UpdateAccessKey
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+        - Statement:
+            - Effect: Allow
+              Action: route53resolver:UpdateFirewallDomains
+              Resource: !Sub "arn:${AWS::Partition}:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-domain-list/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource: !GetAtt IncidentsTable.Arn
+
   AlertFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -546,6 +621,19 @@ Resources:
         - Arn: !GetAtt RouterFunction.Arn
           Id: RouterFunctionTarget
 
+  ReleaseStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/release.asl.json
+      DefinitionSubstitutions:
+        ReleaseFunctionArn: !GetAtt ReleaseFunction.Arn
+        AlertFunctionArn: !GetAtt AlertFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReleaseFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AlertFunction
+
   # Credential exfiltration and AI Protection findings carry resourceType
   # AccessKey, not Instance, so they never match the rule above.
   GuardDutyAccessKeyFindingRule:
@@ -596,6 +684,12 @@ Outputs:
   EvidenceBucketName:
     Description: Object Lock protected bucket holding findings and instance state.
     Value: !Ref EvidenceBucket
+  ReleaseStateMachineArn:
+    Description: >
+      Release machine. Start it with
+      aws stepfunctions start-execution --state-machine-arn <this>
+      --input '{"incidentId":"<id>"}'
+    Value: !Ref ReleaseStateMachine
   QuarantineDnsRuleGroupId:
     Description: DNS Firewall rule group that blocks domains seen in findings.
     Value: !GetAtt QuarantineDnsRuleGroup.Id
