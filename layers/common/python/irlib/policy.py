@@ -175,6 +175,12 @@ def _outcome(rule, policy, context, rule_id=None):
     return {
         "decision": decision,
         "actions": actions,
+        # Step Functions Choice rules cannot test membership of an array, so the
+        # action set is also published as flags the state machine can branch on.
+        "doEvidence": "evidence" in actions,
+        "doNetwork": "network" in actions,
+        "doCredentials": "credentials" in actions,
+        "doImds": "imds" in actions,
         "ruleId": rule_id or rule["id"],
         "ruleDescription": rule.get("description", ""),
         "policyVersion": policy["version"],

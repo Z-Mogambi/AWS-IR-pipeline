@@ -65,6 +65,8 @@ def _downgrade_if_no_target(decision, targets):
     downgraded = dict(decision)
     downgraded["decision"] = "NOTIFY"
     downgraded["actions"] = []
+    for flag in ("doEvidence", "doNetwork", "doCredentials", "doImds"):
+        downgraded[flag] = False
     downgraded["downgradedFrom"] = decision["decision"]
     downgraded["downgradeReason"] = (
         "The finding named no resource this pipeline can act on."

@@ -28,7 +28,8 @@ FUNCTION_LOGICAL_IDS = [
     "VerifyFunction",
     "EnrichFunction",
     "DecideFunction",
-    "IsolateFunction",
+    "EvidenceFunction",
+    "NetIsolateFunction",
     "AlertFunction",
 ]
 
@@ -125,8 +126,17 @@ def test_no_wildcard_actions(transformed, logical_id):
 def test_wildcard_resources_only_where_the_action_requires_it(transformed, logical_id):
     """EC2 Describe calls cannot be scoped to a resource; everything else must be."""
     allowed_on_star = {
+        # EC2 and ELBv2 Describe actions do not support resource-level
+        # permissions. Anything else on "*" is a mistake.
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceAttribute",
         "ec2:DescribeSecurityGroups",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeNetworkAcls",
+        "autoscaling:DescribeAutoScalingInstances",
+        "autoscaling:DescribeAutoScalingGroups",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
     }
     for statement in statements_for(transformed, logical_id):
         resource = statement.get("Resource")
@@ -189,7 +199,7 @@ def test_the_state_machine_can_invoke_exactly_the_states_it_uses(transformed):
 
     # Router is deliberately absent: the state machine must not be able to
     # re-enter the pipeline.
-    assert len(invokable) == 5
+    assert len(invokable) == 6
     assert not any("RouterFunction" in entry for entry in invokable)
 
 
@@ -200,3 +210,65 @@ def test_eventbridge_can_only_invoke_the_router_from_this_account(transformed):
     assert properties["Principal"] == "events.amazonaws.com"
     assert "SourceAccount" in properties, "confused-deputy guard is missing"
     assert "SourceArn" in properties
+
+
+# --- Phase 2 resources ------------------------------------------------------
+
+
+def test_evidence_bucket_is_locked_encrypted_private_and_retained(transformed):
+    bucket = transformed["Resources"]["EvidenceBucket"]
+    properties = bucket["Properties"]
+    assert properties["VersioningConfiguration"]["Status"] == "Enabled"
+    assert properties["ObjectLockEnabled"] is True
+    rule = properties["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]
+    assert rule["Mode"] == "GOVERNANCE"
+    assert properties["BucketEncryption"]
+    for flag in ("BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"):
+        assert properties["PublicAccessBlockConfiguration"][flag] is True
+    assert bucket.get("DeletionPolicy") == "Retain"
+    assert bucket.get("UpdateReplacePolicy") == "Retain"
+
+
+def test_evidence_bucket_refuses_plaintext_transport(transformed):
+    policy = transformed["Resources"]["EvidenceBucketPolicy"]["Properties"]["PolicyDocument"]
+    denies = [s for s in policy["Statement"] if s["Effect"] == "Deny"]
+    assert any(
+        s["Condition"]["Bool"]["aws:SecureTransport"] == "false" for s in denies
+    ), "the bucket policy must deny non-TLS access"
+
+
+def test_nothing_can_bypass_object_lock_governance(transformed):
+    """Retention is only meaningful if the pipeline cannot lift it."""
+    for logical_id in FUNCTION_LOGICAL_IDS:
+        for statement in statements_for(transformed, logical_id):
+            assert "s3:BypassGovernanceRetention" not in actions_of(statement)
+            assert "s3:DeleteObject" not in actions_of(statement)
+
+
+def test_only_the_evidence_function_can_write_evidence(transformed):
+    for logical_id in FUNCTION_LOGICAL_IDS:
+        writes = any(
+            "s3:PutObject" in actions_of(statement)
+            for statement in statements_for(transformed, logical_id)
+        )
+        assert writes == (logical_id == "EvidenceFunction")
+
+
+def test_dns_firewall_rule_group_blocks(transformed):
+    rules = transformed["Resources"]["QuarantineDnsRuleGroup"]["Properties"]["FirewallRules"]
+    assert len(rules) == 1
+    assert rules[0]["Action"] == "BLOCK"
+    assert rules[0]["BlockResponse"] == "NXDOMAIN"
+
+
+def test_the_seed_domain_can_never_resolve(transformed):
+    """The resource requires a domain; it must not be one anyone could register."""
+    domains = transformed["Resources"]["QuarantineDomainList"]["Properties"]["Domains"]
+    assert all(d.endswith(".invalid") for d in domains), domains
+
+
+def test_snapshot_tagging_is_scoped_to_creation(transformed):
+    """ec2:CreateTags is a re-tagging primitive; keep it narrow."""
+    for statement in statements_for(transformed, "NetIsolateFunction"):
+        if "ec2:CreateTags" in actions_of(statement):
+            assert statement["Condition"]["StringEquals"]["ec2:CreateAction"] == "CreateSecurityGroup"

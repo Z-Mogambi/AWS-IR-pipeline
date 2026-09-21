@@ -18,6 +18,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ec2_client = boto3.client("ec2")
+autoscaling_client = boto3.client("autoscaling")
 
 
 def handler(event, context):
@@ -83,6 +84,7 @@ def describe_instance(instance_id):
 
     return {
         "instanceId": raw.get("InstanceId"),
+        "blockDeviceMappings": raw.get("BlockDeviceMappings") or [],
         "instanceType": raw.get("InstanceType"),
         "state": (raw.get("State") or {}).get("Name"),
         "vpcId": raw.get("VpcId"),
@@ -96,4 +98,55 @@ def describe_instance(instance_id):
         "networkInterfaces": interfaces,
         "tags": raw.get("Tags") or [],
         "metadataOptions": raw.get("MetadataOptions") or {},
+        # Release has to restore these, and DescribeInstances does not return
+        # them - they only come from DescribeInstanceAttribute.
+        **instance_attributes(instance_id),
+        **autoscaling_membership(instance_id),
     }
+
+
+def instance_attributes(instance_id):
+    """The three protection settings that evidence collection will change."""
+    wanted = {
+        "disableApiTermination": "disableApiTermination",
+        "disableApiStop": "disableApiStop",
+        "instanceInitiatedShutdownBehavior": "instanceInitiatedShutdownBehavior",
+    }
+    found = {}
+    for field, attribute in wanted.items():
+        try:
+            response = ec2_client.describe_instance_attribute(
+                InstanceId=instance_id, Attribute=attribute
+            )
+            found[field] = (response.get(attribute[0].upper() + attribute[1:]) or {}).get("Value")
+        except Exception as exc:  # noqa: BLE001 - enrichment is best effort
+            logger.warning(f"Could not read {attribute} for {instance_id}: {exc}")
+            found[field] = None
+    return found
+
+
+def autoscaling_membership(instance_id):
+    """Whether an Auto Scaling group would replace this instance once isolated.
+
+    A group using ELB health checks fails an unreachable instance and
+    terminates it, taking the evidence with it, so evidence collection detaches
+    it first. The API is authoritative; the aws:autoscaling:groupName tag is
+    writable by anyone who can tag the instance.
+    """
+    try:
+        response = autoscaling_client.describe_auto_scaling_instances(InstanceIds=[instance_id])
+        records = response.get("AutoScalingInstances") or []
+        if not records:
+            return {"autoScalingGroupName": None, "autoScalingHealthCheckType": None}
+        group_name = records[0].get("AutoScalingGroupName")
+        groups = autoscaling_client.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[group_name]
+        ).get("AutoScalingGroups") or []
+        return {
+            "autoScalingGroupName": group_name,
+            "autoScalingHealthCheckType": groups[0].get("HealthCheckType") if groups else None,
+            "autoScalingTargetGroupArns": groups[0].get("TargetGroupARNs") if groups else [],
+        }
+    except Exception as exc:  # noqa: BLE001 - enrichment is best effort
+        logger.warning(f"Could not read Auto Scaling membership for {instance_id}: {exc}")
+        return {"autoScalingGroupName": None, "autoScalingHealthCheckType": None}

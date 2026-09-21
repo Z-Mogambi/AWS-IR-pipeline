@@ -241,3 +241,68 @@ def list_actions(incident_id, table_name=None, client=None):
     )
     records = [_plain(item) for item in response.get("Items", [])]
     return sorted(records, key=lambda r: (r.get("StartedAt") or "", r.get("RecordId") or ""))
+
+
+def run_action(
+    incident_id,
+    action_key,
+    action,
+    target,
+    perform,
+    prior_state=None,
+    best_effort=False,
+    table_name=None,
+    client=None,
+):
+    """Record, perform, then mark done - the write-ahead invariant in one place.
+
+    Individual containment steps call this instead of touching the ledger
+    themselves, so none of them can forget to record the prior state before
+    mutating, and a retried execution skips whatever already completed.
+
+    `best_effort=True` swallows the failure after recording it. Use it only
+    where the step is genuinely optional - starting a malware scan, say - never
+    for a step that later actions or the release path depend on.
+
+    Returns a summary dict; `status` is DONE, SKIPPED or FAILED.
+    """
+    state, record = begin_action(
+        incident_id,
+        action_key,
+        action,
+        target,
+        prior_state=prior_state,
+        table_name=table_name,
+        client=client,
+    )
+
+    if state == SKIP:
+        return {
+            "action": action,
+            "target": target,
+            "status": STATUS_SKIPPED,
+            "detail": "already completed for this incident",
+            "result": record.get("Result") or {},
+        }
+
+    try:
+        result = perform(record.get("PriorState") or prior_state or {})
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised unless best effort
+        fail_action(incident_id, action_key, exc, table_name=table_name, client=client)
+        logger.error(f"Action {action_key} failed for {incident_id}: {exc}")
+        if best_effort:
+            return {
+                "action": action,
+                "target": target,
+                "status": STATUS_FAILED,
+                "detail": f"best effort, continuing: {exc}",
+            }
+        raise
+
+    complete_action(incident_id, action_key, result, table_name=table_name, client=client)
+    return {
+        "action": action,
+        "target": target,
+        "status": STATUS_DONE,
+        "result": result or {},
+    }

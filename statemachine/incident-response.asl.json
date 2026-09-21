@@ -23,14 +23,15 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "NotifyVerifyFailed"
         }
       ],
       "Next": "EnrichInstance"
     },
-
     "EnrichInstance": {
       "Type": "Task",
       "Comment": "Best effort. On failure the Catch below substitutes a production-by-default result so the run still reaches a decision and a notification.",
@@ -52,14 +53,15 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.enrichmentError",
           "Next": "EnrichmentUnavailable"
         }
       ],
       "Next": "Decide"
     },
-
     "EnrichmentUnavailable": {
       "Type": "Pass",
       "Comment": "Enrichment failed outright. Fall back to production, which is the stricter of the two, and carry on to the decision.",
@@ -67,12 +69,13 @@
         "environment": "production",
         "environmentSource": "default-enrichment-failed",
         "instance": null,
-        "errors": ["The enrichment state failed; see $.enrichmentError."]
+        "errors": [
+          "The enrichment state failed; see $.enrichmentError."
+        ]
       },
       "ResultPath": "$.enrichment",
       "Next": "Decide"
     },
-
     "Decide": {
       "Type": "Task",
       "Comment": "The only place a containment decision is made. Deliberately ahead of the Phase 6 AI triage.",
@@ -94,14 +97,15 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "NotifyPipelineError"
         }
       ],
       "Next": "RouteDecision"
     },
-
     "RouteDecision": {
       "Type": "Choice",
       "Choices": [
@@ -113,7 +117,7 @@
         {
           "Variable": "$.decision.decision",
           "StringEquals": "AUTO_CONTAIN",
-          "Next": "ContainInstance"
+          "Next": "BeginContainment"
         },
         {
           "Variable": "$.decision.decision",
@@ -123,13 +127,11 @@
       ],
       "Default": "NotifyOnly"
     },
-
     "RecordIgnored": {
       "Type": "Pass",
       "Comment": "Below the notification threshold. The incident record still exists.",
       "End": true
     },
-
     "NotifyOnly": {
       "Type": "Task",
       "Resource": "${AlertFunctionArn}",
@@ -147,7 +149,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -155,7 +159,6 @@
       ],
       "End": true
     },
-
     "NotifyApprovalRequired": {
       "Type": "Task",
       "Comment": "Phase 4 turns this into a .waitForTaskToken callback. For now it only notifies; nothing is contained.",
@@ -174,7 +177,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -182,13 +187,33 @@
       ],
       "End": true
     },
-
-    "ContainInstance": {
-      "Type": "Task",
-      "Comment": "Phase 2 replaces this single task with evidence -> network -> credentials -> IMDS, in that order.",
-      "Resource": "${IsolateFunctionArn}",
+    "BeginContainment": {
+      "Type": "Pass",
+      "Comment": "Seed the containment result so later ResultPaths have somewhere to write, and the notification states can reference it whichever steps ran.",
+      "Result": {
+        "evidence": null,
+        "network": null
+      },
       "ResultPath": "$.containment",
-      "TimeoutSeconds": 120,
+      "Next": "ShouldCollectEvidence"
+    },
+    "ShouldCollectEvidence": {
+      "Type": "Choice",
+      "Comment": "Evidence comes first. An isolated instance cannot be reached by SSM, and an Auto Scaling group would replace it the moment it stops answering health checks.",
+      "Choices": [
+        {
+          "Variable": "$.decision.doEvidence",
+          "BooleanEquals": true,
+          "Next": "CollectEvidence"
+        }
+      ],
+      "Default": "ShouldIsolateNetwork"
+    },
+    "CollectEvidence": {
+      "Type": "Task",
+      "Resource": "${EvidenceFunctionArn}",
+      "ResultPath": "$.containment.evidence",
+      "TimeoutSeconds": 300,
       "Retry": [
         {
           "ErrorEquals": [
@@ -204,14 +229,56 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyContainmentFailed"
+        }
+      ],
+      "Next": "ShouldIsolateNetwork"
+    },
+    "ShouldIsolateNetwork": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision.doNetwork",
+          "BooleanEquals": true,
+          "Next": "IsolateNetwork"
+        }
+      ],
+      "Default": "NotifyContained"
+    },
+    "IsolateNetwork": {
+      "Type": "Task",
+      "Comment": "Per-incident quarantine group, opened wide so existing flows become untracked, applied to every ENI, then sealed. Phase 3 adds credential containment and disabling IMDS after this.",
+      "Resource": "${NetIsolateFunctionArn}",
+      "ResultPath": "$.containment.network",
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "NotifyContainmentFailed"
         }
       ],
       "Next": "NotifyContained"
     },
-
     "NotifyContained": {
       "Type": "Task",
       "Resource": "${AlertFunctionArn}",
@@ -230,7 +297,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -238,7 +307,6 @@
       ],
       "End": true
     },
-
     "NotifyContainmentFailed": {
       "Type": "Task",
       "Comment": "Partial containment. Nothing is rolled back; the alert reports from the ledger exactly which actions completed.",
@@ -258,7 +326,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -266,7 +336,6 @@
       ],
       "Next": "ContainmentIncomplete"
     },
-
     "NotifyVerifyFailed": {
       "Type": "Task",
       "Comment": "The finding was missing, archived, or did not match its identifiers. No action taken.",
@@ -283,7 +352,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -291,7 +362,6 @@
       ],
       "Next": "NotVerified"
     },
-
     "NotifyPipelineError": {
       "Type": "Task",
       "Resource": "${AlertFunctionArn}",
@@ -309,7 +379,9 @@
       "TimeoutSeconds": 30,
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2
@@ -317,19 +389,16 @@
       ],
       "Next": "PipelineFailed"
     },
-
     "NotVerified": {
       "Type": "Fail",
       "Error": "FindingNotVerified",
       "Cause": "The finding could not be re-fetched, or was archived. A notification was sent."
     },
-
     "ContainmentIncomplete": {
       "Type": "Fail",
       "Error": "ContainmentIncomplete",
       "Cause": "Containment did not finish. Nothing was rolled back; see the incident record."
     },
-
     "PipelineFailed": {
       "Type": "Fail",
       "Error": "PipelineError",

@@ -16,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASL_DIR = ROOT / "statemachine"
 ASL_FILES = sorted(ASL_DIR.glob("*.asl.json"))
 
-CONTAINMENT_STATES = {"ContainInstance"}
+CONTAINMENT_STATES = {"CollectEvidence", "IsolateNetwork"}
 
 
 def load(path):
@@ -131,18 +131,19 @@ def test_auto_contain_is_the_only_route_into_containment():
     document = load(ASL_DIR / "incident-response.asl.json")
     route = document["States"]["RouteDecision"]
     auto = [c["Next"] for c in route["Choices"] if c.get("StringEquals") == "AUTO_CONTAIN"]
-    assert auto == ["ContainInstance"]
+    assert auto == ["BeginContainment"]
 
 
 def test_containment_failure_notifies_before_failing():
     """A partial containment must never end silently."""
     states = load(ASL_DIR / "incident-response.asl.json")["States"]
-    catchers = states["ContainInstance"]["Catch"]
-    assert catchers, "containment must catch its own failures"
-    for catcher in catchers:
-        target = states[catcher["Next"]]
-        assert target["Type"] == "Task", "the catch target must send a notification"
-        assert target["Parameters"]["notifyKind"] == "CONTAINMENT_FAILED"
+    for name in CONTAINMENT_STATES:
+        catchers = states[name]["Catch"]
+        assert catchers, f"{name} must catch its own failures"
+        for catcher in catchers:
+            target = states[catcher["Next"]]
+            assert target["Type"] == "Task", "the catch target must send a notification"
+            assert target["Parameters"]["notifyKind"] == "CONTAINMENT_FAILED"
 
 
 def test_verification_failure_notifies_before_failing():
@@ -165,3 +166,29 @@ def test_every_task_has_a_timeout():
         for name, state in load(path)["States"].items():
             if state["Type"] == "Task":
                 assert state.get("TimeoutSeconds"), f"{path.name}:{name} has no TimeoutSeconds"
+
+
+def test_containment_runs_evidence_before_network():
+    """The order the whole phase depends on.
+
+    Isolation cuts off the SSM agent and makes an Auto Scaling group replace the
+    instance, so evidence collection and ASG detachment have to happen first.
+    """
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    after_evidence = reachable_from(states, "CollectEvidence")
+    after_network = reachable_from(states, "IsolateNetwork")
+    assert "IsolateNetwork" in after_evidence, "network isolation must follow evidence"
+    assert "CollectEvidence" not in after_network, "evidence must not follow isolation"
+
+
+def test_containment_steps_are_individually_skippable():
+    """Each step is gated on its own flag from the decision."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    for gate, action_flag, step in (
+        ("ShouldCollectEvidence", "$.decision.doEvidence", "CollectEvidence"),
+        ("ShouldIsolateNetwork", "$.decision.doNetwork", "IsolateNetwork"),
+    ):
+        choice = states[gate]["Choices"][0]
+        assert choice["Variable"] == action_flag
+        assert choice["BooleanEquals"] is True
+        assert choice["Next"] == step

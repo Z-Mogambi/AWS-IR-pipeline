@@ -31,6 +31,39 @@ Parameters:
       Optional email address to subscribe to the alerts topic. Leave empty to
       manage subscriptions yourself. Without a subscriber, alerts go nowhere.
 
+  EvidenceRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: >
+      Object Lock default retention, in days, on the evidence bucket. Governance
+      mode: an object cannot be deleted or overwritten for this long without the
+      s3:BypassGovernanceRetention permission, which nothing in this stack has.
+
+  EnableNaclBackstop:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Add stateless NACL deny entries for the remote addresses named in the
+      finding, as a second line behind the security group work. Off by default:
+      NACLs are subnet-wide, so this affects every instance in the subnet.
+
+  EnableMemoryCapture:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Run the SSM memory-capture hook before isolation. Off by default and not
+      yet implemented - see the note in src/evidence/lambda_function.py.
+
+  DnsFirewallRuleGroupPriority:
+    Type: Number
+    Default: 101
+    Description: >
+      Priority for associating the DNS Firewall block rule group with a VPC.
+      Must not collide with an existing association in the same VPC.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
 
@@ -78,6 +111,73 @@ Resources:
       TopicArn: !Ref AlertsSNSTopic
       Protocol: email
       Endpoint: !Ref AlertEmailEndpoint
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    # Evidence outlives the stack. Object Lock cannot be turned on after
+    # creation, so it is set here rather than left to a later change.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: !Ref EvidenceRetentionDays
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub "${EvidenceBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # Security groups do not filter DNS traffic to the Route 53 Resolver, so a
+  # DNS-tunnelled channel survives network isolation entirely. This is the only
+  # control that closes it. Note it is VPC-wide, not instance-scoped.
+  QuarantineDomainList:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: !Sub "${AWS::StackName}-quarantine-domains"
+      # The resource requires at least one domain. This is an RFC 2606 reserved
+      # name that can never resolve; real domains are added per incident.
+      Domains:
+        - quarantine-placeholder.invalid
+
+  QuarantineDnsRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-quarantine"
+      FirewallRules:
+        - FirewallDomainListId: !GetAtt QuarantineDomainList.Id
+          Priority: 1
+          Action: BLOCK
+          BlockResponse: NXDOMAIN
 
   IncidentsTable:
     Type: AWS::DynamoDB::Table
@@ -158,34 +258,54 @@ Resources:
               Action: dynamodb:UpdateItem
               Resource: !GetAtt IncidentsTable.Arn
 
-  IsolateFunction:
+  EvidenceFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/isolate/
-      Timeout: 120
+      CodeUri: src/evidence/
+      Timeout: 300
+      MemorySize: 256
       Policies:
         - Statement:
             - Effect: Allow
-              Action:
-                - ec2:DescribeSecurityGroups
-              Resource: "*"
+              Action: s3:PutObject
+              Resource: !Sub "${EvidenceBucket.Arn}/*"
         - Statement:
             - Effect: Allow
               Action:
-                - ec2:CreateSecurityGroup
-              Resource:
-                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
-                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
-            - Effect: Allow
-              Action:
-                - ec2:RevokeSecurityGroupEgress
-              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
-            - Effect: Allow
-              Action:
                 - ec2:ModifyInstanceAttribute
+                - ec2:CreateSnapshots
               Resource:
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
-                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+            - Effect: Allow
+              # Tagging the snapshots CreateSnapshots produces, and labelling
+              # the instance so it is obvious in the console.
+              Action: ec2:CreateTags
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+        - Statement:
+            - Effect: Allow
+              Action: autoscaling:DetachInstances
+              Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*"
+        - Statement:
+            - Effect: Allow
+              # Neither Describe action supports resource-level permissions.
+              Action:
+                - elasticloadbalancing:DescribeTargetGroups
+                - elasticloadbalancing:DescribeTargetHealth
+              Resource: "*"
+            - Effect: Allow
+              Action: elasticloadbalancing:DeregisterTargets
+              Resource: !Sub "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*"
+        - Statement:
+            - Effect: Allow
+              # Best effort. Requires Malware Protection to be enabled on the
+              # detector beforehand - the service-linked role is deliberately
+              # not created here, so this function needs no IAM write access.
+              Action: guardduty:StartMalwareScan
+              Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -193,6 +313,74 @@ Resources:
                 - dynamodb:GetItem
                 - dynamodb:UpdateItem
               Resource: !GetAtt IncidentsTable.Arn
+      Environment:
+        Variables:
+          EVIDENCE_BUCKET: !Ref EvidenceBucket
+          ENABLE_MEMORY_CAPTURE: !Ref EnableMemoryCapture
+
+  NetIsolateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/netisolate/
+      Timeout: 180
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # EC2 Describe actions cannot be scoped to a resource.
+              Action:
+                - ec2:DescribeSecurityGroups
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DescribeNetworkAcls
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action: ec2:CreateSecurityGroup
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+            - Effect: Allow
+              Action: ec2:CreateTags
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              Condition:
+                StringEquals:
+                  "ec2:CreateAction": CreateSecurityGroup
+            - Effect: Allow
+              Action:
+                - ec2:AuthorizeSecurityGroupIngress
+                - ec2:AuthorizeSecurityGroupEgress
+                - ec2:RevokeSecurityGroupIngress
+                - ec2:RevokeSecurityGroupEgress
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+            - Effect: Allow
+              Action: ec2:ModifyNetworkInterfaceAttribute
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+            - Effect: Allow
+              Action: ec2:CreateNetworkAclEntry
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*"
+        - Statement:
+            - Effect: Allow
+              Action: route53resolver:UpdateFirewallDomains
+              Resource: !Sub "arn:${AWS::Partition}:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-domain-list/*"
+            - Effect: Allow
+              Action:
+                - route53resolver:AssociateFirewallRuleGroup
+                - route53resolver:ListFirewallRuleGroupAssociations
+              Resource: !Sub "arn:${AWS::Partition}:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-rule-group/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
+      Environment:
+        Variables:
+          ENABLE_NACL_BACKSTOP: !Ref EnableNaclBackstop
+          DNS_FIREWALL_DOMAIN_LIST_ID: !GetAtt QuarantineDomainList.Id
+          DNS_FIREWALL_RULE_GROUP_ID: !GetAtt QuarantineDnsRuleGroup.Id
+          DNS_FIREWALL_PRIORITY: !Ref DnsFirewallRuleGroupPriority
 
   AlertFunction:
     Type: AWS::Serverless::Function
@@ -221,7 +409,8 @@ Resources:
         VerifyFunctionArn: !GetAtt VerifyFunction.Arn
         EnrichFunctionArn: !GetAtt EnrichFunction.Arn
         DecideFunctionArn: !GetAtt DecideFunction.Arn
-        IsolateFunctionArn: !GetAtt IsolateFunction.Arn
+        EvidenceFunctionArn: !GetAtt EvidenceFunction.Arn
+        NetIsolateFunctionArn: !GetAtt NetIsolateFunction.Arn
         AlertFunctionArn: !GetAtt AlertFunction.Arn
       Policies:
         - LambdaInvokePolicy:
@@ -231,7 +420,9 @@ Resources:
         - LambdaInvokePolicy:
             FunctionName: !Ref DecideFunction
         - LambdaInvokePolicy:
-            FunctionName: !Ref IsolateFunction
+            FunctionName: !Ref EvidenceFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NetIsolateFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AlertFunction
 
@@ -273,3 +464,9 @@ Outputs:
   IncidentsTableName:
     Description: DynamoDB table holding the write-ahead incident ledger.
     Value: !Ref IncidentsTable
+  EvidenceBucketName:
+    Description: Object Lock protected bucket holding findings and instance state.
+    Value: !Ref EvidenceBucket
+  QuarantineDnsRuleGroupId:
+    Description: DNS Firewall rule group that blocks domains seen in findings.
+    Value: !GetAtt QuarantineDnsRuleGroup.Id
