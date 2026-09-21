@@ -20,57 +20,108 @@ logger.setLevel(logging.INFO)
 ec2_client = boto3.client("ec2")
 autoscaling_client = boto3.client("autoscaling")
 
+# An attack sequence can name a large group of instances. Enrichment is bounded
+# so a wide sequence cannot time the function out; the containment cap in the
+# decision is a separate, smaller limit.
+MAX_ENRICHED_INSTANCES = 25
+
 
 def handler(event, context):
     logger.info(f"Enriching: {json.dumps(event)}")
 
     account_id = event.get("accountId")
-    instance_ids = (event.get("finding") or {}).get("targets", {}).get("instanceIds") or []
+    named = (event.get("finding") or {}).get("targets", {}).get("instanceIds") or []
+    instance_ids = named[:MAX_ENRICHED_INSTANCES]
+    truncated = named[MAX_ENRICHED_INSTANCES:]
     errors = []
-    instance = None
 
+    if truncated:
+        errors.append(
+            f"The finding named {len(named)} instances; enriched the first "
+            f"{MAX_ENRICHED_INSTANCES}. Not enriched: {truncated}"
+        )
+        logger.warning(errors[-1])
+
+    instances = []
     if instance_ids:
-        try:
-            instance = describe_instance(instance_ids[0])
-        except Exception as exc:  # noqa: BLE001 - enrichment must never stop the run
-            errors.append(f"DescribeInstances failed for {instance_ids[0]}: {exc}")
-            logger.warning(errors[-1])
+        instances, describe_errors = describe_instances(instance_ids)
+        errors.extend(describe_errors)
     else:
         errors.append("Finding named no usable instance id.")
         logger.warning(errors[-1])
 
+    # The environment is a property of the incident, not of each instance, so
+    # it is resolved from the first one that could be described. A sequence
+    # spanning environments resolves to whatever the first instance says; the
+    # account map is the way to make that deterministic.
+    first = instances[0] if instances else None
     environment, source = envresolve.resolve(
         account_id=account_id,
-        tags=(instance or {}).get("tags"),
+        tags=(first or {}).get("tags"),
     )
-    if instance is None and source == "default-missing-tag":
+    if first is None and source == "default-missing-tag":
         source = "default-enrichment-unavailable"
 
     result = {
         "environment": environment,
         "environmentSource": source,
-        "instance": instance,
+        # `instance` stays for the single-instance path; `instances` is what the
+        # containment Map iterates over.
+        "instance": first,
+        "instances": instances,
+        "instanceCount": len(instances),
         "errors": errors,
     }
     logger.info(
         f"Enrichment complete: environment={environment} ({source}) "
-        f"instance={'yes' if instance else 'no'} errors={len(errors)}"
+        f"instances={len(instances)}/{len(named)} errors={len(errors)}"
     )
     return result
 
 
-def describe_instance(instance_id):
+def describe_instances(instance_ids):
+    """Describe them in one call, falling back to one at a time.
+
+    DescribeInstances fails the whole request if any id is unknown, which for a
+    sequence naming a terminated instance would lose every other instance too.
+    """
+    errors = []
+    try:
+        return [_summarise(raw) for raw in _fetch(instance_ids)], errors
+    except Exception as exc:  # noqa: BLE001 - enrichment must never stop the run
+        logger.warning(f"Batch DescribeInstances failed ({exc}); retrying one at a time.")
+
+    instances = []
+    for instance_id in instance_ids:
+        try:
+            instances.extend(_summarise(raw) for raw in _fetch([instance_id]))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"DescribeInstances failed for {instance_id}: {exc}")
+            logger.warning(errors[-1])
+    return instances, errors
+
+
+def _fetch(instance_ids):
+    response = ec2_client.describe_instances(InstanceIds=instance_ids)
+    found = [
+        instance
+        for reservation in response.get("Reservations") or []
+        for instance in reservation.get("Instances") or []
+    ]
+    if not found:
+        raise ValueError(f"No instances found for {instance_ids}")
+    return found
+
+
+def _summarise(raw_instance):
     """Return the slice of DescribeInstances the pipeline actually uses.
 
     Passing the whole reservation onward would push a large, mostly unused blob
-    through every remaining state and toward the 256 KB payload limit.
+    through every remaining state and toward the 256 KB payload limit - and an
+    attack sequence multiplies that by the number of instances.
     """
-    response = ec2_client.describe_instances(InstanceIds=[instance_id])
-    reservations = response.get("Reservations") or []
-    if not reservations or not reservations[0].get("Instances"):
-        raise ValueError(f"Instance {instance_id} not found")
-
-    raw = json.loads(json.dumps(reservations[0]["Instances"][0], default=str))
+    raw = json.loads(json.dumps(raw_instance, default=str))
+    instance_id = raw.get("InstanceId")
     interfaces = [
         {
             "networkInterfaceId": eni.get("NetworkInterfaceId"),

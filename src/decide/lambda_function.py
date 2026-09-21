@@ -23,6 +23,12 @@ ACTIONABLE = ("AUTO_CONTAIN", "APPROVAL_REQUIRED")
 APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "3600"))
 APPROVAL_TIMEOUT_ACTION = os.environ.get("APPROVAL_TIMEOUT_ACTION", "Escalate")
 
+# An attack sequence names a group of instances. Containing a handful
+# automatically is one thing; containing a whole Auto Scaling group or every
+# instance built from one AMI is an outage, so above this many a human decides.
+MAX_AUTO_CONTAIN_INSTANCES = int(os.environ.get("MAX_AUTO_CONTAIN_INSTANCES", "3"))
+CONTAINMENT_CONCURRENCY = int(os.environ.get("CONTAINMENT_CONCURRENCY", "2"))
+
 
 def handler(event, context):
     logger.info(f"Deciding: {json.dumps(event)}")
@@ -40,7 +46,10 @@ def handler(event, context):
     )
 
     decision = _downgrade_if_no_target(decision, targets)
+    decision = _cap_bulk_containment(decision, targets)
+    decision = _mark_escalation(decision, targets)
     decision["environmentSource"] = enrichment.get("environmentSource")
+    decision["maxConcurrency"] = CONTAINMENT_CONCURRENCY
     decision["approvalTimeoutSeconds"] = APPROVAL_TIMEOUT_SECONDS
     # In production the default is to escalate, not to contain: nobody
     # answering an approval request is not consent to act.
@@ -56,6 +65,58 @@ def handler(event, context):
         f"via {decision['ruleId']} (policy v{decision['policyVersion']})"
     )
     return decision
+
+
+def _cap_bulk_containment(decision, targets):
+    """Above the cap, an attack sequence needs a human rather than a Map state.
+
+    AttackSequence findings name a group of resources that share an Auto
+    Scaling group, instance profile, launch template, CloudFormation stack, AMI
+    or VPC. Containing three compromised instances is incident response;
+    containing thirty because they share an AMI is an outage.
+    """
+    if decision["decision"] != "AUTO_CONTAIN":
+        return decision
+
+    instance_ids = targets.get("instanceIds") or []
+    if len(instance_ids) <= MAX_AUTO_CONTAIN_INSTANCES:
+        return decision
+
+    capped = dict(decision)
+    capped["decision"] = "APPROVAL_REQUIRED"
+    capped["downgradedFrom"] = "AUTO_CONTAIN"
+    capped["downgradeReason"] = (
+        f"The finding names {len(instance_ids)} instances, above the "
+        f"MaxAutoContainInstances cap of {MAX_AUTO_CONTAIN_INSTANCES}. "
+        "Containing this many at once needs a human decision."
+    )
+    capped["instanceCount"] = len(instance_ids)
+    logger.warning(capped["downgradeReason"])
+    return capped
+
+
+def _mark_escalation(decision, targets):
+    """A known-vulnerable, internet-reachable resource is the worst combination.
+
+    VULNERABILITY means Inspector found CVEs on a resource in the sequence;
+    REACHABILITY means one is reachable from the internet. Either alone is
+    common. Both together says the way in is known and open, so the incident is
+    marked escalated in the record and the notification.
+    """
+    sequence = targets.get("sequence")
+    if not sequence:
+        return decision
+
+    marked = dict(decision)
+    marked["escalated"] = bool(sequence.get("escalated"))
+    marked["sequenceIndicators"] = sequence.get("indicatorKeys") or []
+    if marked["escalated"]:
+        marked["escalationReason"] = (
+            "The sequence carries both VULNERABILITY and REACHABILITY indicators: "
+            "a resource with known CVEs that is reachable from the internet."
+        )
+        logger.warning(marked["escalationReason"])
+    return marked
 
 
 def _downgrade_if_no_target(decision, targets):

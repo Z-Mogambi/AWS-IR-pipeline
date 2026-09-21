@@ -14,9 +14,12 @@ auditable rather than assumed.
 
 Two other things this fixes over the previous implementation:
 
-* the quarantine group is created per incident and tagged with the incident id.
-  A shared group meant two concurrent incidents raced on it, and opening it for
-  one instance briefly un-isolated every other instance behind it.
+* the quarantine group is created per *instance* and tagged with both the
+  incident and the instance id. A shared group meant concurrent runs raced on
+  it, and - because the technique above opens the group before sealing it -
+  opening it for one instance would briefly un-isolate every other instance
+  behind it. That matters within a single incident too: an attack sequence
+  contains several instances at once.
 * every ENI is moved with ModifyNetworkInterfaceAttribute.
   ModifyInstanceAttribute(Groups=...) only moves the primary interface, so a
   multi-ENI instance stayed reachable on its others.
@@ -87,21 +90,22 @@ def handler(event, context):
         performed.append(result)
         return result
 
-    # 1. A group of this incident's own, so nothing else is affected by what
-    #    happens to it next.
+    # 1. A group of this instance's own, so opening it cannot affect anything
+    #    else - including the other instances of the same attack sequence,
+    #    which are contained concurrently.
     created = step(
-        f"quarantine-sg-create#{incident_id}", "quarantine-sg-create", vpc_id,
-        lambda prior: create_quarantine_group(incident_id, vpc_id),
+        f"quarantine-sg-create#{instance_id}", "quarantine-sg-create", instance_id,
+        lambda prior: create_quarantine_group(incident_id, instance_id, vpc_id),
     )
     quarantine_sg_id = (created.get("result") or {}).get("groupId")
     if not quarantine_sg_id:
-        quarantine_sg_id = find_quarantine_group(incident_id, vpc_id)
+        quarantine_sg_id = find_quarantine_group(incident_id, instance_id, vpc_id)
     if not quarantine_sg_id:
-        raise RuntimeError(f"Could not resolve the quarantine group for incident {incident_id}")
+        raise RuntimeError(f"Could not resolve the quarantine group for {instance_id}")
 
     # 2. Open it wide. This is the deliberate, brief exposure.
     step(
-        f"quarantine-sg-open#{incident_id}", "quarantine-sg-open", quarantine_sg_id,
+        f"quarantine-sg-open#{instance_id}", "quarantine-sg-open", quarantine_sg_id,
         lambda prior: open_all_traffic(quarantine_sg_id),
     )
 
@@ -118,7 +122,7 @@ def handler(event, context):
 
     # 4. Close it. Flows that became untracked in step 2 die here.
     sealed = step(
-        f"quarantine-sg-seal#{incident_id}", "quarantine-sg-seal", quarantine_sg_id,
+        f"quarantine-sg-seal#{instance_id}", "quarantine-sg-seal", quarantine_sg_id,
         lambda prior: seal_group(quarantine_sg_id),
     )
 
@@ -131,6 +135,8 @@ def handler(event, context):
         )
 
     if targets.get("domains") and DNS_FIREWALL_DOMAIN_LIST_ID:
+        # Domain blocking is VPC-wide, so it is keyed by incident rather than by
+        # instance: several instances of one sequence must not each re-add it.
         step(
             f"dns-block#{incident_id}", "dns-block", ",".join(targets["domains"]),
             lambda prior: block_domains(vpc_id, targets["domains"]),
@@ -154,38 +160,40 @@ def handler(event, context):
 # --- security group ---------------------------------------------------------
 
 
-def quarantine_group_name(incident_id):
+def quarantine_group_name(instance_id):
     # Security group names are capped at 255 characters.
-    return f"ir-quarantine-{incident_id}"[:255]
+    return f"ir-quarantine-{instance_id}"[:255]
 
 
-def find_quarantine_group(incident_id, vpc_id):
+def find_quarantine_group(incident_id, instance_id, vpc_id):
     response = ec2_client.describe_security_groups(
         Filters=[
             {"Name": "vpc-id", "Values": [vpc_id]},
             {"Name": "tag:IRPipeline:IncidentId", "Values": [incident_id]},
+            {"Name": "tag:IRPipeline:InstanceId", "Values": [instance_id]},
         ]
     )
     groups = response.get("SecurityGroups") or []
     return groups[0]["GroupId"] if groups else None
 
 
-def create_quarantine_group(incident_id, vpc_id):
-    """One group per incident, tagged so release can find and delete it."""
-    existing = find_quarantine_group(incident_id, vpc_id)
+def create_quarantine_group(incident_id, instance_id, vpc_id):
+    """One group per instance, tagged so release can find and delete it."""
+    existing = find_quarantine_group(incident_id, instance_id, vpc_id)
     if existing:
-        logger.info(f"Reusing quarantine group {existing} for incident {incident_id}")
+        logger.info(f"Reusing quarantine group {existing} for {instance_id}")
         return {"groupId": existing, "created": False}
 
     response = ec2_client.create_security_group(
-        GroupName=quarantine_group_name(incident_id),
-        Description=f"IR quarantine for incident {incident_id}",
+        GroupName=quarantine_group_name(instance_id),
+        Description=f"IR quarantine for {instance_id} (incident {incident_id})",
         VpcId=vpc_id,
         TagSpecifications=[
             {
                 "ResourceType": "security-group",
                 "Tags": [
                     {"Key": "IRPipeline:IncidentId", "Value": incident_id},
+                    {"Key": "IRPipeline:InstanceId", "Value": instance_id},
                     {"Key": "IRPipeline:Role", "Value": "quarantine"},
                 ],
             }

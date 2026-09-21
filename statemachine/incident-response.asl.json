@@ -274,199 +274,189 @@
       "Type": "Pass",
       "Comment": "Seed the containment result so later ResultPaths have somewhere to write, and the notification states can reference it whichever steps ran.",
       "Result": {
-        "evidence": null,
-        "network": null,
-        "credentials": null,
-        "identity": null,
-        "imds": null
+        "instances": null
       },
       "ResultPath": "$.containment",
-      "Next": "ShouldCollectEvidence"
+      "Next": "ContainInstances"
     },
-    "ShouldCollectEvidence": {
-      "Type": "Choice",
-      "Comment": "Evidence comes first. An isolated instance cannot be reached by SSM, and an Auto Scaling group would replace it the moment it stops answering health checks.",
-      "Choices": [
-        {
-          "Variable": "$.decision.doEvidence",
-          "BooleanEquals": true,
-          "Next": "CollectEvidence"
+    "ContainInstances": {
+      "Type": "Map",
+      "Comment": "One iteration per instance. An attack sequence names a group of them; a single-resource finding simply yields one iteration.",
+      "ItemsPath": "$.enrichment.instances",
+      "MaxConcurrencyPath": "$.decision.maxConcurrency",
+      "Parameters": {
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "decision.$": "$.decision",
+        "enrichment": {
+          "instance.$": "$$.Map.Item.Value",
+          "environment.$": "$.enrichment.environment"
         }
-      ],
-      "Default": "ShouldIsolateNetwork"
-    },
-    "CollectEvidence": {
-      "Type": "Task",
-      "Resource": "${EvidenceFunctionArn}",
-      "ResultPath": "$.containment.evidence",
-      "TimeoutSeconds": 300,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2
+      },
+      "Iterator": {
+        "StartAt": "ShouldCollectEvidence",
+        "States": {
+          "ShouldCollectEvidence": {
+            "Type": "Choice",
+            "Comment": "Evidence comes first. An isolated instance cannot be reached by SSM, and an Auto Scaling group would replace it the moment it stops answering health checks.",
+            "Choices": [
+              {
+                "Variable": "$.decision.doEvidence",
+                "BooleanEquals": true,
+                "Next": "CollectEvidence"
+              }
+            ],
+            "Default": "ShouldIsolateNetwork"
+          },
+          "CollectEvidence": {
+            "Type": "Task",
+            "Resource": "${EvidenceFunctionArn}",
+            "ResultPath": "$.containment.evidence",
+            "TimeoutSeconds": 300,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "ShouldIsolateNetwork"
+          },
+          "ShouldIsolateNetwork": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.decision.doNetwork",
+                "BooleanEquals": true,
+                "Next": "IsolateNetwork"
+              }
+            ],
+            "Default": "ShouldContainCredentials"
+          },
+          "IsolateNetwork": {
+            "Type": "Task",
+            "Comment": "Per-incident quarantine group, opened wide so existing flows become untracked, applied to every ENI, then sealed. Phase 3 adds credential containment and disabling IMDS after this.",
+            "Resource": "${NetIsolateFunctionArn}",
+            "ResultPath": "$.containment.network",
+            "TimeoutSeconds": 180,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "ShouldContainCredentials"
+          },
+          "ShouldContainCredentials": {
+            "Type": "Choice",
+            "Comment": "Network isolation does nothing about credentials already stolen from the instance - the attacker is using them from their own machine.",
+            "Choices": [
+              {
+                "Variable": "$.decision.doCredentials",
+                "BooleanEquals": true,
+                "Next": "ContainCredentials"
+              }
+            ],
+            "Default": "ShouldDisableImds"
+          },
+          "ContainCredentials": {
+            "Type": "Task",
+            "Comment": "The only state that reaches the function holding iam:PutRolePolicy.",
+            "Resource": "${CredContainFunctionArn}",
+            "ResultPath": "$.containment.credentials",
+            "TimeoutSeconds": 60,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "ContainIdentity"
+          },
+          "ContainIdentity": {
+            "Type": "Task",
+            "Comment": "IAM user access keys only. The role paths are handled by the state above.",
+            "Resource": "${IdentityFunctionArn}",
+            "ResultPath": "$.containment.identity",
+            "TimeoutSeconds": 60,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "ShouldDisableImds"
+          },
+          "ShouldDisableImds": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.decision.doImds",
+                "BooleanEquals": true,
+                "Next": "DisableImds"
+              }
+            ],
+            "Default": "InstanceContained"
+          },
+          "DisableImds": {
+            "Type": "Task",
+            "Comment": "Last, because it also cuts off the SSM agent. Nothing can be run on the instance remotely after this.",
+            "Resource": "${ImdsFunctionArn}",
+            "ResultPath": "$.containment.imds",
+            "TimeoutSeconds": 60,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "InstanceContained"
+          },
+          "InstanceContained": {
+            "Type": "Pass",
+            "Comment": "End of the per-instance chain. The Map collects one of these per instance.",
+            "End": true
+          }
         }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.error",
-          "Next": "NotifyContainmentFailed"
-        }
-      ],
-      "Next": "ShouldIsolateNetwork"
-    },
-    "ShouldIsolateNetwork": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.decision.doNetwork",
-          "BooleanEquals": true,
-          "Next": "IsolateNetwork"
-        }
-      ],
-      "Default": "ShouldContainCredentials"
-    },
-    "IsolateNetwork": {
-      "Type": "Task",
-      "Comment": "Per-incident quarantine group, opened wide so existing flows become untracked, applied to every ENI, then sealed. Phase 3 adds credential containment and disabling IMDS after this.",
-      "Resource": "${NetIsolateFunctionArn}",
-      "ResultPath": "$.containment.network",
-      "TimeoutSeconds": 180,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.error",
-          "Next": "NotifyContainmentFailed"
-        }
-      ],
-      "Next": "ShouldContainCredentials"
-    },
-    "ShouldContainCredentials": {
-      "Type": "Choice",
-      "Comment": "Network isolation does nothing about credentials already stolen from the instance - the attacker is using them from their own machine.",
-      "Choices": [
-        {
-          "Variable": "$.decision.doCredentials",
-          "BooleanEquals": true,
-          "Next": "ContainCredentials"
-        }
-      ],
-      "Default": "ShouldDisableImds"
-    },
-    "ContainCredentials": {
-      "Type": "Task",
-      "Comment": "The only state that reaches the function holding iam:PutRolePolicy.",
-      "Resource": "${CredContainFunctionArn}",
-      "ResultPath": "$.containment.credentials",
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.error",
-          "Next": "NotifyContainmentFailed"
-        }
-      ],
-      "Next": "ContainIdentity"
-    },
-    "ContainIdentity": {
-      "Type": "Task",
-      "Comment": "IAM user access keys only. The role paths are handled by the state above.",
-      "Resource": "${IdentityFunctionArn}",
-      "ResultPath": "$.containment.identity",
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.error",
-          "Next": "NotifyContainmentFailed"
-        }
-      ],
-      "Next": "ShouldDisableImds"
-    },
-    "ShouldDisableImds": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.decision.doImds",
-          "BooleanEquals": true,
-          "Next": "DisableImds"
-        }
-      ],
-      "Default": "NotifyContained"
-    },
-    "DisableImds": {
-      "Type": "Task",
-      "Comment": "Last, because it also cuts off the SSM agent. Nothing can be run on the instance remotely after this.",
-      "Resource": "${ImdsFunctionArn}",
-      "ResultPath": "$.containment.imds",
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "IntervalSeconds": 2,
-          "MaxAttempts": 3,
-          "BackoffRate": 2
-        }
-      ],
+      },
+      "ResultPath": "$.containment.instances",
       "Catch": [
         {
           "ErrorEquals": [

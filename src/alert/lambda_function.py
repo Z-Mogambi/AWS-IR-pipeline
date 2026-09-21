@@ -66,8 +66,9 @@ def handler(event, context):
     instances = targets.get("instanceIds") or []
     instance_label = ", ".join(instances) if instances else "no actionable instance"
 
+    escalated = "[ESCALATED]" if decision.get("escalated") else ""
     subject = safe_subject(
-        f"[{HEADLINE.get(kind, kind)}][{environment}] "
+        f"[{HEADLINE.get(kind, kind)}]{escalated}[{environment}] "
         f"{summary.get('type') or 'GuardDuty finding'} - {instance_label}"
     )
     message = build_message(kind, event, summary, targets, enrichment, decision, containment, error)
@@ -106,6 +107,9 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
     if targets.get("remoteIps"):
         lines.append(f"Remote IPs:  {', '.join(targets['remoteIps'])}")
     lines.append("")
+
+    if targets.get("sequence"):
+        lines += sequence_lines(targets["sequence"], decision)
 
     lines.append("DECISION")
     lines.append(f"  {decision.get('decision', 'n/a')} by rule {decision.get('ruleId', 'n/a')} "
@@ -166,6 +170,51 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
         lines.append("No containment was performed for this finding.")
 
     return "\n".join(lines)
+
+
+def sequence_lines(sequence, decision):
+    """Render an Extended Threat Detection attack sequence.
+
+    A sequence is a correlated group of signals across several resources, so
+    the summary and indicators are the part a responder reads first - not the
+    individual signals.
+    """
+    lines = [
+        "ATTACK SEQUENCE",
+        f"  {sequence.get('description') or '(no description)'}",
+        f"  Sequence id: {sequence.get('uid')}",
+        f"  {sequence.get('signalCount', 0)} signal(s) across "
+        f"{sequence.get('resourceCount', 0)} resource(s)",
+    ]
+
+    if sequence.get("instanceIds"):
+        lines.append(f"  EC2 instances: {', '.join(sequence['instanceIds'])}")
+
+    for indicator in sequence.get("indicators") or []:
+        lines.append(
+            f"    [{indicator.get('key')}] {indicator.get('title') or ''} "
+            f"{_render_values(indicator.get('values'))}".rstrip()
+        )
+
+    if decision.get("escalated"):
+        lines += [
+            "",
+            "  ESCALATED: " + (decision.get("escalationReason") or ""),
+        ]
+    lines.append("")
+    return lines
+
+
+def _render_values(values):
+    """Indicator values are usually strings, but some carry nested structure.
+
+    SUSPICIOUS_NETWORK, for instance, is documented with a mapping of network
+    name to tags, so anything non-string is serialised rather than assumed.
+    """
+    if not values:
+        return ""
+    rendered = [v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in values]
+    return "(" + ", ".join(rendered[:5]) + ")"
 
 
 def approval_lines(kind, event):

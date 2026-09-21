@@ -1,0 +1,80 @@
+{
+  "version": "0",
+  "id": "a1b2c3d4-0000-0000-0000-example00001",
+  "detail-type": "GuardDuty Finding",
+  "source": "aws.guardduty",
+  "account": "123456789012",
+  "time": "2026-09-21T12:00:00Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "schemaVersion": "2.0",
+    "accountId": "123456789012",
+    "region": "us-east-1",
+    "partition": "aws",
+    "id": "sample-attack-sequence-ir-pipeline",
+    "arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/sample-attack-sequence-ir-pipeline",
+    "type": "AttackSequence:EC2/CompromisedInstanceGroup",
+    "severity": 9,
+    "createdAt": "2026-09-21T12:00:00.000Z",
+    "updatedAt": "2026-09-21T12:05:00.000Z",
+    "title": "A group of EC2 instances is potentially compromised.",
+    "description": "Multiple EC2 instances sharing an instance profile show correlated cryptomining and command and control activity.",
+    "resource": {
+      "resourceType": "Instance"
+    },
+    "service": {
+      "serviceName": "guardduty",
+      "detectorId": "example",
+      "archived": false,
+      "resourceRole": "ACTOR",
+      "count": 1,
+      "detection": {
+        "sequence": {
+          "uid": "sequence-example-0001",
+          "description": "Credentials obtained from IMDS were used from outside the account, followed by cryptomining on instances sharing an instance profile.",
+          "signals": [
+            {"uid": "signal-1", "type": "finding", "name": "CryptoCurrency:EC2/BitcoinTool.B"},
+            {"uid": "signal-2", "type": "finding", "name": "Backdoor:EC2/C&CActivity.B!DNS"},
+            {"uid": "signal-3", "type": "cloudtrail", "name": "GetCallerIdentity"}
+          ],
+          "resources": [
+            {
+              "uid": "arn:aws:ec2:us-east-1:123456789012:instance/i-0111111111aaaaaaa",
+              "name": "i-0111111111aaaaaaa",
+              "resourceType": "EC2_INSTANCE",
+              "accountId": "123456789012",
+              "region": "us-east-1"
+            },
+            {
+              "uid": "arn:aws:ec2:us-east-1:123456789012:instance/i-0222222222bbbbbbb",
+              "name": "i-0222222222bbbbbbb",
+              "resourceType": "EC2_INSTANCE",
+              "accountId": "123456789012",
+              "region": "us-east-1"
+            },
+            {
+              "uid": "arn:aws:iam::123456789012:instance-profile/shared-app-profile",
+              "name": "shared-app-profile",
+              "resourceType": "IAM_INSTANCE_PROFILE",
+              "accountId": "123456789012"
+            },
+            {
+              "uid": "vpc-0abcdef0123456789",
+              "name": "vpc-0abcdef0123456789",
+              "resourceType": "EC2_VPC",
+              "accountId": "123456789012",
+              "region": "us-east-1"
+            }
+          ],
+          "sequenceIndicators": [
+            {"key": "ATTACK_TACTIC", "title": "MITRE tactics", "values": ["Impact", "CredentialAccess"]},
+            {"key": "CRYPTOMINING_DOMAIN", "title": "Mining pool", "values": ["pool.example.invalid"]},
+            {"key": "VULNERABILITY", "title": "Known CVEs on an involved resource", "values": ["CVE-0000-00000"]},
+            {"key": "REACHABILITY", "title": "Reachable from the internet", "values": ["i-0111111111aaaaaaa"]}
+          ]
+        }
+      }
+    }
+  }
+}

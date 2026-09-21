@@ -226,14 +226,38 @@ def test_identity_function_is_scoped_to_users(transformed):
             assert ":user/" in json.dumps(statement["Resource"])
 
 
-def test_access_key_findings_have_their_own_rule(transformed):
-    """Credential exfiltration and AI Protection carry resourceType AccessKey."""
+def test_the_three_finding_rules_cover_the_three_shapes(transformed):
+    """Instance findings, AccessKey findings, and attack sequences.
+
+    They are deliberately non-overlapping: credential exfiltration and AI
+    Protection carry resourceType AccessKey, and attack sequences carry no
+    top-level resourceType at all, so each needs its own pattern.
+    """
     rules = resources_of(transformed, "AWS::Events::Rule")
-    resource_types = set()
+    assert len(rules) == 3
+
+    resource_types, type_prefixes = set(), set()
     for body in rules.values():
-        pattern = body["Properties"]["EventPattern"]
-        resource_types.update(pattern["detail"]["resource"]["resourceType"])
+        detail = body["Properties"]["EventPattern"]["detail"]
+        if "resource" in detail:
+            resource_types.update(detail["resource"]["resourceType"])
+        for matcher in detail.get("type", []):
+            type_prefixes.add(matcher["prefix"])
+
     assert resource_types == {"Instance", "AccessKey"}
+    assert type_prefixes == {"AttackSequence:"}
+
+
+def test_attack_sequences_are_matched_on_the_type_prefix(transformed):
+    rules = resources_of(transformed, "AWS::Events::Rule")
+    sequence_rules = [
+        body for body in rules.values()
+        if "type" in body["Properties"]["EventPattern"]["detail"]
+    ]
+    assert len(sequence_rules) == 1
+    detail = sequence_rules[0]["Properties"]["EventPattern"]["detail"]
+    # It must not also filter on a resource type, or it would never match.
+    assert "resource" not in detail
 
 
 def test_every_eventbridge_rule_targets_only_the_router(transformed):
@@ -277,7 +301,8 @@ def test_the_state_machine_can_invoke_exactly_the_states_it_uses(transformed):
 
 def test_eventbridge_can_only_invoke_the_router_from_this_account(transformed):
     permissions = resources_of(transformed, "AWS::Lambda::Permission")
-    assert len(permissions) == 2, "one permission per EventBridge rule"
+    rules = resources_of(transformed, "AWS::Events::Rule")
+    assert len(permissions) == len(rules), "one permission per EventBridge rule"
     for body in permissions.values():
         properties = body["Properties"]
         assert properties["Principal"] == "events.amazonaws.com"
@@ -412,3 +437,11 @@ def test_nothing_in_the_stack_can_approve_its_own_requests(transformed):
 def test_the_timeout_action_cannot_be_set_to_something_unexpected(transformed):
     allowed = transformed["Parameters"]["ApprovalTimeoutAction"]["AllowedValues"]
     assert set(allowed) == {"Escalate", "Contain"}
+
+
+def test_the_containment_cap_and_concurrency_reach_the_decide_function(transformed):
+    variables = resources_of(transformed, "AWS::Lambda::Function")["DecideFunction"][
+        "Properties"
+    ]["Environment"]["Variables"]
+    assert "MAX_AUTO_CONTAIN_INSTANCES" in variables
+    assert "CONTAINMENT_CONCURRENCY" in variables

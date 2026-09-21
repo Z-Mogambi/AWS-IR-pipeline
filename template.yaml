@@ -90,6 +90,28 @@ Parameters:
       not consent. Contain proceeds, and should only be used where an
       unattended containment is genuinely safer than waiting.
 
+  MaxAutoContainInstances:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: >
+      How many instances one finding may contain automatically. Attack sequences
+      name a group of resources that share an Auto Scaling group, instance
+      profile, launch template, CloudFormation stack, AMI or VPC - so above this
+      many, the finding goes to approval instead. Containing three compromised
+      instances is incident response; containing thirty because they share an
+      AMI is an outage.
+
+  ContainmentConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: >
+      How many instances are contained in parallel. Kept small because every
+      iteration makes several EC2 and IAM calls, and the account-wide rate
+      limits are shared with everything else running.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
 
@@ -287,6 +309,8 @@ Resources:
         Variables:
           APPROVAL_TIMEOUT_SECONDS: !Ref ApprovalTimeoutSeconds
           APPROVAL_TIMEOUT_ACTION: !Ref ApprovalTimeoutAction
+          MAX_AUTO_CONTAIN_INSTANCES: !Ref MaxAutoContainInstances
+          CONTAINMENT_CONCURRENCY: !Ref ContainmentConcurrency
 
   EvidenceFunction:
     Type: AWS::Serverless::Function
@@ -661,6 +685,35 @@ Resources:
       Principal: events.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt GuardDutyAccessKeyFindingRule.Arn
+
+  # Attack sequence findings carry no top-level resourceType that the two rules
+  # above would match; their affected resources live under
+  # service.detection.sequence.resources instead. They are matched on the type
+  # prefix, so the three rules stay non-overlapping.
+  GuardDutyAttackSequenceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: GuardDuty Extended Threat Detection attack sequences.
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          type:
+            - prefix: "AttackSequence:"
+      Targets:
+        - Arn: !GetAtt RouterFunction.Arn
+          Id: RouterFunctionAttackSequenceTarget
+
+  InvokeRouterFromAttackSequenceRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RouterFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt GuardDutyAttackSequenceRule.Arn
 
   InvokeRouterPermission:
     Type: AWS::Lambda::Permission

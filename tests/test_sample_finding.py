@@ -176,3 +176,105 @@ def test_the_sample_finding_would_otherwise_have_been_contained():
     """Confirms the degradation above is doing real work, not hiding a NOTIFY."""
     result = policy.evaluate("Backdoor:EC2/C&CActivity.B!DNS", 8.0, "production", "Instance", "ACTOR")
     assert result["decision"] == "AUTO_CONTAIN"
+
+
+def test_enrichment_describes_every_named_instance(monkeypatch):
+    """An attack sequence names a group, and containment maps over all of them."""
+    calls = []
+
+    class Ec2:
+        def describe_instances(self, **kwargs):
+            calls.append(kwargs["InstanceIds"])
+            return {
+                "Reservations": [
+                    {"Instances": [
+                        {"InstanceId": instance_id, "VpcId": "vpc-1",
+                         "Tags": [{"Key": "Environment", "Value": "Production"}]}
+                        for instance_id in kwargs["InstanceIds"]
+                    ]}
+                ]
+            }
+
+        def describe_instance_attribute(self, **_kwargs):
+            return {}
+
+    class Asg:
+        def describe_auto_scaling_instances(self, **_kwargs):
+            return {"AutoScalingInstances": []}
+
+    monkeypatch.setattr(enrich, "ec2_client", Ec2())
+    monkeypatch.setattr(enrich, "autoscaling_client", Asg())
+
+    result = enrich.handler(
+        {
+            "accountId": "123456789012",
+            "finding": {"targets": {"instanceIds": ["i-0111111111aaaaaaa", "i-0222222222bbbbbbb"]}},
+        },
+        None,
+    )
+    assert result["instanceCount"] == 2
+    assert [i["instanceId"] for i in result["instances"]] == [
+        "i-0111111111aaaaaaa", "i-0222222222bbbbbbb"
+    ]
+    # One batched call, not one per instance.
+    assert calls[0] == ["i-0111111111aaaaaaa", "i-0222222222bbbbbbb"]
+
+
+def test_one_terminated_instance_does_not_lose_the_others(monkeypatch):
+    """DescribeInstances fails the whole request if any id is unknown."""
+    attempts = []
+
+    class Ec2:
+        def describe_instances(self, **kwargs):
+            ids = kwargs["InstanceIds"]
+            attempts.append(ids)
+            if len(ids) > 1 or ids == ["i-0999999999ccccccc"]:
+                raise RuntimeError("InvalidInstanceID.NotFound")
+            return {"Reservations": [{"Instances": [{"InstanceId": ids[0], "VpcId": "vpc-1"}]}]}
+
+        def describe_instance_attribute(self, **_kwargs):
+            return {}
+
+    class Asg:
+        def describe_auto_scaling_instances(self, **_kwargs):
+            return {"AutoScalingInstances": []}
+
+    monkeypatch.setattr(enrich, "ec2_client", Ec2())
+    monkeypatch.setattr(enrich, "autoscaling_client", Asg())
+
+    result = enrich.handler(
+        {
+            "accountId": "123456789012",
+            "finding": {"targets": {"instanceIds": ["i-0111111111aaaaaaa", "i-0999999999ccccccc"]}},
+        },
+        None,
+    )
+    assert [i["instanceId"] for i in result["instances"]] == ["i-0111111111aaaaaaa"]
+    assert any("i-0999999999ccccccc" in error for error in result["errors"])
+    # Batch first, then one at a time.
+    assert len(attempts) == 3
+
+
+def test_enrichment_is_bounded_for_a_wide_sequence(monkeypatch):
+    class Ec2:
+        def describe_instances(self, **kwargs):
+            return {"Reservations": [{"Instances": [
+                {"InstanceId": i, "VpcId": "vpc-1"} for i in kwargs["InstanceIds"]
+            ]}]}
+
+        def describe_instance_attribute(self, **_kwargs):
+            return {}
+
+    class Asg:
+        def describe_auto_scaling_instances(self, **_kwargs):
+            return {"AutoScalingInstances": []}
+
+    monkeypatch.setattr(enrich, "ec2_client", Ec2())
+    monkeypatch.setattr(enrich, "autoscaling_client", Asg())
+
+    many = [f"i-{n:017x}" for n in range(60)]
+    result = enrich.handler(
+        {"accountId": "123456789012", "finding": {"targets": {"instanceIds": many}}}, None
+    )
+    assert result["instanceCount"] == enrich.MAX_ENRICHED_INSTANCES
+    assert any("enriched the first" in error for error in result["errors"])

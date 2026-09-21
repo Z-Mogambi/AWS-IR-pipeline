@@ -194,13 +194,26 @@ def test_each_interfaces_original_groups_are_recorded_before_it_moves(wired):
 # --- per incident, not shared ------------------------------------------------
 
 
-def test_the_quarantine_group_is_tagged_with_the_incident(wired):
-    """A shared group would briefly un-isolate every other quarantined instance."""
+def test_the_quarantine_group_is_per_instance_not_per_incident(wired):
+    """Opening a shared group would briefly un-isolate everything behind it.
+
+    That matters within one incident too: an attack sequence contains several
+    instances concurrently, so they cannot share a group.
+    """
     log, configure = wired
     configure()
     netisolate.handler(build_event(), None)
-    tags = params(log, "ec2.create_security_group")[0]["TagSpecifications"][0]["Tags"]
+
+    call = params(log, "ec2.create_security_group")[0]
+    tags = call["TagSpecifications"][0]["Tags"]
     assert {"Key": "IRPipeline:IncidentId", "Value": "inc-1"} in tags
+    assert {"Key": "IRPipeline:InstanceId", "Value": "i-0123456789abcdef0"} in tags
+    assert call["GroupName"] == "ir-quarantine-i-0123456789abcdef0"
+
+    # The lookup is scoped to this instance, so a sibling's group is not reused.
+    lookup = params(log, "ec2.describe_security_groups")[0]
+    filters = {f["Name"]: f["Values"] for f in lookup["Filters"]}
+    assert filters["tag:IRPipeline:InstanceId"] == ["i-0123456789abcdef0"]
 
 
 def test_an_existing_group_for_this_incident_is_reused(wired):
@@ -223,7 +236,8 @@ def test_an_existing_group_for_this_incident_is_reused(wired):
 def test_completed_steps_are_not_repeated_on_a_re_run(wired):
     log, configure = wired
     configure(completed={
-        "ACTION#quarantine-sg-create#inc-1": {"groupId": "sg-quarantine", "created": False},
+        "ACTION#quarantine-sg-create#i-0123456789abcdef0": {"groupId": "sg-quarantine",
+                                                            "created": False},
         "ACTION#eni-isolate#eni-primary": {"networkInterfaceId": "eni-primary"},
     })
     netisolate.handler(build_event(), None)

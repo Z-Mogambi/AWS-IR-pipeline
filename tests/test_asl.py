@@ -16,13 +16,40 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASL_DIR = ROOT / "statemachine"
 ASL_FILES = sorted(ASL_DIR.glob("*.asl.json"))
 
-CONTAINMENT_STATES = {"CollectEvidence", "IsolateNetwork", "ContainCredentials",
-                      "ContainIdentity", "DisableImds"}
+# At the top level, all containment happens inside this one Map state.
+CONTAINMENT_STATES = {"ContainInstances"}
+
+# The per-instance chain, which lives inside that Map's iterator.
+CONTAINMENT_STEPS = ["CollectEvidence", "IsolateNetwork", "ContainCredentials",
+                     "ContainIdentity", "DisableImds"]
 
 
 def load(path):
     with path.open() as handle:
         return json.load(handle)
+
+
+def machines(document):
+    """Every state machine in a definition: the top level, plus each Map iterator.
+
+    A Next inside an iterator refers to that iterator's states, so structural
+    checks have to be scoped per machine rather than run over a flattened list.
+    """
+    found = [("top-level", document["StartAt"], document["States"])]
+    queue = list(document["States"].items())
+    while queue:
+        name, state = queue.pop()
+        for key in ("Iterator", "ItemProcessor"):
+            nested = state.get(key)
+            if not nested:
+                continue
+            found.append((name, nested["StartAt"], nested["States"]))
+            queue.extend(nested["States"].items())
+    return found
+
+
+def iterator_of(document, map_state):
+    return document["States"][map_state]["Iterator"]["States"]
 
 
 def transitions(state):
@@ -55,25 +82,25 @@ def test_is_valid_json(path):
 
 @pytest.mark.parametrize("path", ASL_FILES, ids=lambda p: p.name)
 def test_every_transition_target_exists(path):
-    states = load(path)["States"]
-    for name, state in states.items():
-        for target in transitions(state):
-            assert target in states, f"{name} transitions to unknown state {target}"
+    for label, _start, states in machines(load(path)):
+        for name, state in states.items():
+            for target in transitions(state):
+                assert target in states, f"{label}:{name} transitions to unknown state {target}"
 
 
 @pytest.mark.parametrize("path", ASL_FILES, ids=lambda p: p.name)
 def test_every_state_is_reachable(path):
-    document = load(path)
-    states = document["States"]
-    unreachable = set(states) - reachable_from(states, document["StartAt"])
-    assert not unreachable, f"unreachable states: {sorted(unreachable)}"
+    for label, start, states in machines(load(path)):
+        unreachable = set(states) - reachable_from(states, start)
+        assert not unreachable, f"{label}: unreachable states {sorted(unreachable)}"
 
 
 @pytest.mark.parametrize("path", ASL_FILES, ids=lambda p: p.name)
 def test_every_state_terminates_or_transitions(path):
-    for name, state in load(path)["States"].items():
-        terminal = state.get("End") or state["Type"] in ("Fail", "Succeed")
-        assert terminal or transitions(state), f"{name} neither ends nor transitions"
+    for label, _start, states in machines(load(path)):
+        for name, state in states.items():
+            terminal = state.get("End") or state["Type"] in ("Fail", "Succeed")
+            assert terminal or transitions(state), f"{label}:{name} neither ends nor transitions"
 
 
 @pytest.mark.parametrize("path", ASL_FILES, ids=lambda p: p.name)
@@ -219,12 +246,13 @@ def test_no_task_can_wait_forever():
     numeric field.
     """
     for path in ASL_FILES:
-        for name, state in load(path)["States"].items():
-            if state["Type"] != "Task":
-                continue
-            assert state.get("TimeoutSeconds") or state.get("TimeoutSecondsPath"), (
-                f"{path.name}:{name} has neither TimeoutSeconds nor TimeoutSecondsPath"
-            )
+        for label, _start, states in machines(load(path)):
+            for name, state in states.items():
+                if state["Type"] != "Task":
+                    continue
+                assert state.get("TimeoutSeconds") or state.get("TimeoutSecondsPath"), (
+                    f"{path.name}:{label}:{name} has no timeout"
+                )
 
 
 def test_containment_order_is_evidence_network_credentials_imds():
@@ -234,7 +262,7 @@ def test_containment_order_is_evidence_network_credentials_imds():
     replaces an unreachable instance. IMDS last: disabling it also cuts off the
     agent, so nothing can be run on the instance remotely afterwards.
     """
-    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    states = iterator_of(load(ASL_DIR / "incident-response.asl.json"), "ContainInstances")
     order = ["CollectEvidence", "IsolateNetwork", "ContainCredentials", "DisableImds"]
     for earlier, later in zip(order, order[1:]):
         assert later in reachable_from(states, earlier), f"{later} must be able to follow {earlier}"
@@ -243,26 +271,28 @@ def test_containment_order_is_evidence_network_credentials_imds():
 
 def test_disabling_imds_is_the_last_containment_step():
     """It cuts off the SSM agent, so nothing may need the instance after it."""
-    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    states = iterator_of(load(ASL_DIR / "incident-response.asl.json"), "ContainInstances")
     after = reachable_from(states, "DisableImds") - {"DisableImds"}
-    assert not (after & CONTAINMENT_STATES), (
-        f"containment continues after IMDS is disabled: {sorted(after & CONTAINMENT_STATES)}"
+    assert not (after & set(CONTAINMENT_STEPS)), (
+        f"containment continues after IMDS is disabled: {sorted(after & set(CONTAINMENT_STEPS))}"
     )
 
 
 def test_only_one_state_reaches_the_credential_containment_function():
     """iam:PutRolePolicy is reachable from exactly one place in the machine."""
-    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    document = load(ASL_DIR / "incident-response.asl.json")
     callers = [
-        name for name, body in states.items()
+        f"{label}:{name}"
+        for label, _start, states in machines(document)
+        for name, body in states.items()
         if body.get("Resource") == "${CredContainFunctionArn}"
     ]
-    assert callers == ["ContainCredentials"]
+    assert callers == ["ContainInstances:ContainCredentials"]
 
 
 def test_containment_steps_are_individually_skippable():
     """Each step is gated on its own flag from the decision."""
-    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    states = iterator_of(load(ASL_DIR / "incident-response.asl.json"), "ContainInstances")
     for gate, action_flag, step in (
         ("ShouldCollectEvidence", "$.decision.doEvidence", "CollectEvidence"),
         ("ShouldIsolateNetwork", "$.decision.doNetwork", "IsolateNetwork"),
@@ -273,3 +303,44 @@ def test_containment_steps_are_individually_skippable():
         assert choice["Variable"] == action_flag
         assert choice["BooleanEquals"] is True
         assert choice["Next"] == step
+
+
+# --- Phase 5: attack sequences ----------------------------------------------
+
+
+def test_containment_iterates_over_every_enriched_instance():
+    """An attack sequence names a group of instances, not one."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    contain = states["ContainInstances"]
+    assert contain["Type"] == "Map"
+    assert contain["ItemsPath"] == "$.enrichment.instances"
+
+
+def test_map_concurrency_is_bounded():
+    """Unbounded fan-out across an Auto Scaling group would hit EC2 rate limits."""
+    contain = load(ASL_DIR / "incident-response.asl.json")["States"]["ContainInstances"]
+    assert contain.get("MaxConcurrency") or contain.get("MaxConcurrencyPath"), (
+        "the containment Map must bound its concurrency"
+    )
+
+
+def test_each_iteration_sees_only_its_own_instance():
+    """Otherwise a step could act on a sibling instance of the same sequence."""
+    contain = load(ASL_DIR / "incident-response.asl.json")["States"]["ContainInstances"]
+    enrichment = contain["Parameters"]["enrichment"]
+    assert enrichment["instance.$"] == "$$.Map.Item.Value"
+    assert "instances.$" not in enrichment
+
+
+def test_a_single_instance_finding_still_works_through_the_map():
+    """The Map is the only containment path, so one instance means one iteration."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    assert states["BeginContainment"]["Next"] == "ContainInstances"
+    iterator = iterator_of(load(ASL_DIR / "incident-response.asl.json"), "ContainInstances")
+    assert iterator["ShouldCollectEvidence"]["Type"] == "Choice"
+
+
+def test_one_failed_instance_does_not_end_silently():
+    """The Map catches so a partial containment still notifies."""
+    contain = load(ASL_DIR / "incident-response.asl.json")["States"]["ContainInstances"]
+    assert contain["Catch"][0]["Next"] == "NotifyContainmentFailed"
