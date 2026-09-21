@@ -1,0 +1,73 @@
+# Tests, linting and template validation for pull requests.
+#
+# `pull_request` is deliberate. `pull_request_target` runs with the base repo's
+# secrets and a write-capable token while checking out the contributor's code,
+# which turns any pull request into arbitrary code execution with this repo's
+# credentials. This workflow needs no secrets at all.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only, and nothing below overrides it. The job needs to read the code and
+# nothing more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and template validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the code
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          # Matches the Lambda runtime in template.yaml.
+          python-version: '3.14'
+
+      - name: Install development dependencies
+        # --require-hashes refuses the file unless every dependency, including
+        # every transitive one, is pinned with a hash.
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            -r requirements-dev.txt
+
+      - name: Check for third-party runtime dependencies
+        # Runs first: a new dependency in a function is the change most worth
+        # catching before anything else runs.
+        run: python -m pytest tests/test_supply_chain.py -q
+
+      - name: Run the test suite
+        # Nothing here contacts AWS; every client is stubbed or monkeypatched.
+        run: python -m pytest -q
+
+      - name: Set up SAM CLI
+        # aws-actions/setup-sam v3
+        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310
+        with:
+          use-installer: true
+
+      - name: Validate the template
+        # --lint runs cfn-lint over the template. No credentials are configured
+        # for this job, so a Region is supplied explicitly.
+        run: sam validate --lint --region us-east-1
+
+      - name: Build
+        # Catches packaging problems - a bad CodeUri, a function that cannot be
+        # bundled - that validation alone does not.
+        run: sam build

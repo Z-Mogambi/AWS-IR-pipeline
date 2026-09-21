@@ -14,6 +14,12 @@ import sys
 
 import pytest
 
+# Importing irlib from the layer directory would leave __pycache__ inside it,
+# and `sam build` copies that directory verbatim into the layer zip. Nothing
+# breaks, but shipping stale bytecode for a different Python build is untidy at
+# best and confusing at worst.
+sys.dont_write_bytecode = True
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LAYER = ROOT / "layers" / "common" / "python"
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"

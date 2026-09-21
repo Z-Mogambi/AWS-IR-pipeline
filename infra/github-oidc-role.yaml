@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Actions OIDC deploy role for the incident response pipeline.
+  Deploy this once, by hand, before using .github/workflows/deploy.yml. It is
+  deliberately separate from template.yaml: the role that deploys the stack
+  should not be created by the stack it deploys.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Description: Repository name, without the owner.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: >
+      The only branch permitted to assume this role. The trust policy matches
+      the full subject string, so a pull request from a fork cannot assume it -
+      a fork's token carries sub "repo:owner/name:pull_request", not this ref.
+
+  CreateOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create the GitHub OIDC provider. Set to false if another stack in this
+      account already created it - there can only be one per account.
+
+  PipelineStackName:
+    Type: String
+    Default: ir-pipeline-prod
+    Description: >
+      CloudFormation stack this role may deploy. The role cannot touch any
+      other stack.
+
+  ArtifactBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      The S3 bucket SAM uploads artifacts to. Leave empty to allow the
+      aws-sam-cli-managed-default bucket that `sam deploy --resolve-s3` creates.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    Description: >
+      Strongly recommended. A deploy role that can create IAM roles can create
+      one more privileged than itself, which makes it administrator-equivalent.
+      Setting this forces every role the deployment creates to carry this
+      boundary, which caps that. Create the boundary policy first.
+
+Conditions:
+  ShouldCreateProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+  HasArtifactBucket: !Not [!Equals [!Ref ArtifactBucketName, ""]]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS verifies GitHub's certificate chain against its own trust store for
+      # this provider, so the thumbprint no longer has to be maintained by hand.
+      # The value below is the long-standing GitHub Actions root thumbprint and
+      # is kept only because the property is required.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PipelineStackName}-github-deploy"
+      Description: !Sub "Deploys ${PipelineStackName} from ${GitHubOrg}/${GitHubRepo}."
+      MaxSessionDuration: 3600
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateProvider
+                - !Ref GitHubOIDCProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # StringEquals, not StringLike. A wildcard here - for example
+                # "repo:org/repo:*" - would let any branch, tag or pull request
+                # in the repository assume the role.
+                token.actions.githubusercontent.com:sub:
+                  !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+
+      Policies:
+        - PolicyName: deploy-the-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- CloudFormation, scoped to this one stack ------------------
+              - Sid: ManageOnlyThisStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${PipelineStackName}/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*"
+
+              - Sid: ReadTheServerlessTransform
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+
+              # Deliberately absent: cloudformation:DeleteStack. Tearing the
+              # pipeline down is a deliberate act, not something a push does.
+
+              # --- artifacts --------------------------------------------------
+              - Sid: UploadBuildArtifacts
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !If
+                  - HasArtifactBucket
+                  - - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
+                    - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*"
+                  - - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-default*"
+                    - !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-default*/*"
+
+              - Sid: LetSamCreateItsManagedBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketTagging
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                Resource: !Sub "arn:${AWS::Partition}:s3:::aws-sam-cli-managed-default*"
+
+              # --- the resources the stack creates ---------------------------
+              - Sid: ManagePipelineResources
+                Effect: Allow
+                Action:
+                  - lambda:*
+                  - states:*
+                  - events:*
+                  - sns:*
+                  - dynamodb:*
+                  - route53resolver:*
+                  - bedrock:CreateGuardrail
+                  - bedrock:UpdateGuardrail
+                  - bedrock:DeleteGuardrail
+                  - bedrock:GetGuardrail
+                  - bedrock:ListGuardrails
+                  - bedrock:TagResource
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:DeleteDashboards
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                # These are broad because CloudFormation creates and names the
+                # resources itself, so their ARNs are not known in advance. The
+                # meaningful boundary is the stack scope above: this role cannot
+                # deploy any other stack. Narrow further with a tag condition
+                # once the resource names are stable.
+                Resource: "*"
+
+              - Sid: ManageTheEvidenceBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketObjectLockConfiguration
+                  - s3:GetBucketLocation
+                  - s3:PutBucketTagging
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${PipelineStackName}-*"
+                # Note: no s3:DeleteBucket. The evidence bucket carries
+                # DeletionPolicy: Retain, and nothing in CI should be able to
+                # remove it.
+
+              # --- IAM, the part that needs care ------------------------------
+              - Sid: ManageStackRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                # Only roles belonging to this stack. SAM names every function
+                # role "<stack>-<Function>Role-<suffix>".
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${PipelineStackName}-*"
+                Condition: !If
+                  - HasPermissionsBoundary
+                  # Every role this deployment creates must carry the boundary,
+                  # so the deploy role cannot mint something more privileged
+                  # than itself.
+                  - StringEquals:
+                      iam:PermissionsBoundary: !Ref PermissionsBoundaryArn
+                  - !Ref AWS::NoValue
+
+              - Sid: DenyTouchingItsOwnRole
+                Effect: Deny
+                Action:
+                  - iam:*
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${PipelineStackName}-github-deploy"
+
+Outputs:
+  DeployRoleArn:
+    Description: >
+      Set this as the repository variable AWS_DEPLOY_ROLE_ARN used by
+      .github/workflows/deploy.yml.
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  TrustedSubject:
+    Description: The only OIDC subject permitted to assume the role.
+    Value: !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
