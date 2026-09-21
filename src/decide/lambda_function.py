@@ -28,6 +28,12 @@ APPROVAL_TIMEOUT_ACTION = os.environ.get("APPROVAL_TIMEOUT_ACTION", "Escalate")
 # instance built from one AMI is an outage, so above this many a human decides.
 MAX_AUTO_CONTAIN_INSTANCES = int(os.environ.get("MAX_AUTO_CONTAIN_INSTANCES", "3"))
 CONTAINMENT_CONCURRENCY = int(os.environ.get("CONTAINMENT_CONCURRENCY", "2"))
+# Triage runs only when a model is configured. It never affects the decision
+# above; this flag only tells the state machine whether to bother calling it.
+AI_TRIAGE_ENABLED = os.environ.get("AI_TRIAGE_ENABLED", "false").lower() == "true"
+INVESTIGATION_ENABLED = (
+    os.environ.get("ENABLE_GUARDDUTY_INVESTIGATION", "false").lower() == "true"
+)
 
 
 def handler(event, context):
@@ -50,6 +56,8 @@ def handler(event, context):
     decision = _mark_escalation(decision, targets)
     decision["environmentSource"] = enrichment.get("environmentSource")
     decision["maxConcurrency"] = CONTAINMENT_CONCURRENCY
+    decision["aiTriageEnabled"] = AI_TRIAGE_ENABLED
+    decision["investigationEnabled"] = INVESTIGATION_ENABLED
     decision["approvalTimeoutSeconds"] = APPROVAL_TIMEOUT_SECONDS
     # In production the default is to escalate, not to contain: nobody
     # answering an approval request is not consent to act.

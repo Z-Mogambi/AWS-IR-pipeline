@@ -35,6 +35,9 @@ FUNCTION_LOGICAL_IDS = [
     "IdentityFunction",
     "ImdsFunction",
     "ReleaseFunction",
+    "AiEnrichFunction",
+    "TriageValidateFunction",
+    "InvestigateFunction",
     "AlertFunction",
 ]
 
@@ -142,6 +145,10 @@ def test_wildcard_resources_only_where_the_action_requires_it(transformed, logic
         "autoscaling:DescribeAutoScalingGroups",
         "elasticloadbalancing:DescribeTargetGroups",
         "elasticloadbalancing:DescribeTargetHealth",
+        # Neither of these has any resource type in the service authorization
+        # reference, so "*" is the narrowest they can be written.
+        "cloudtrail:LookupEvents",
+        "inspector2:ListFindings",
     }
     for statement in statements_for(transformed, logical_id):
         resource = statement.get("Resource")
@@ -281,22 +288,39 @@ def test_incidents_table_is_encrypted_recoverable_and_retained(transformed):
     assert table.get("UpdateReplacePolicy") == "Retain"
 
 
-def test_the_state_machine_can_invoke_exactly_the_states_it_uses(transformed):
+def test_the_state_machine_can_invoke_exactly_what_its_definition_uses(transformed):
+    """Derived from the ASL rather than a hard-coded count.
+
+    The property is that the role grants invoke on exactly the functions the
+    definition names - no more, and never the Router, which would let the
+    machine re-enter the pipeline.
+    """
+    import re
+
+    asl = (ROOT / "statemachine" / "incident-response.asl.json").read_text()
+    used = {
+        name.removesuffix("Arn")
+        for name in re.findall(r"\$\{([A-Za-z0-9_]+FunctionArn)\}", asl)
+    }
+    assert used, "the definition should reference some functions"
+
     machines = resources_of(transformed, "AWS::StepFunctions::StateMachine")
-    assert len(machines) == 2, "the response machine and the release machine"
     body = [m for name, m in machines.items() if "Release" not in name][0]
     role_name = body["Properties"]["RoleArn"]["Fn::GetAtt"][0]
 
-    invokable = set()
+    granted = set()
     for policy in transformed["Resources"][role_name]["Properties"]["Policies"]:
         for statement in policy["PolicyDocument"]["Statement"]:
-            if "lambda:InvokeFunction" in actions_of(statement):
-                invokable.add(str(statement["Resource"]))
+            if "lambda:InvokeFunction" not in actions_of(statement):
+                continue
+            match = re.search(r"'Ref': '(\w+Function)'", str(statement["Resource"]))
+            if match:
+                granted.add(match.group(1))
 
-    # Router is deliberately absent: the state machine must not be able to
-    # re-enter the pipeline.
-    assert len(invokable) == 9
-    assert not any("RouterFunction" in entry for entry in invokable)
+    assert granted == used, f"granted {sorted(granted)} but the definition uses {sorted(used)}"
+    assert "RouterFunction" not in granted, (
+        "the state machine must not be able to re-enter the pipeline"
+    )
 
 
 def test_eventbridge_can_only_invoke_the_router_from_this_account(transformed):
@@ -445,3 +469,60 @@ def test_the_containment_cap_and_concurrency_reach_the_decide_function(transform
     ]["Environment"]["Variables"]
     assert "MAX_AUTO_CONTAIN_INSTANCES" in variables
     assert "CONTAINMENT_CONCURRENCY" in variables
+
+
+# --- Phase 6: AI triage ------------------------------------------------------
+
+
+def test_the_triage_model_id_has_no_default(transformed):
+    """A wrong model id should fail at deploy time, not silently pick one."""
+    assert transformed["Parameters"]["BedrockModelId"]["Default"] == ""
+
+
+def test_the_guardrail_filters_prompt_attacks(transformed):
+    guardrail = transformed["Resources"]["TriageGuardrail"]["Properties"]
+    filters = guardrail["ContentPolicyConfig"]["FiltersConfig"]
+    prompt_attack = [f for f in filters if f["Type"] == "PROMPT_ATTACK"]
+    assert prompt_attack, "the guardrail must carry a prompt-attack filter"
+    assert prompt_attack[0]["InputStrength"] == "HIGH"
+
+
+def test_the_enrichment_function_is_read_only(transformed):
+    """Blast radius is a question about the role, never a reason to change it."""
+    forbidden_prefixes = ("iam:Put", "iam:Delete", "iam:Attach", "iam:Detach", "iam:Update",
+                          "iam:Create", "ec2:Modify", "ec2:Terminate")
+    for statement in statements_for(transformed, "AiEnrichFunction"):
+        for action in actions_of(statement):
+            assert not action.startswith(forbidden_prefixes), (
+                f"AiEnrichFunction holds a mutating permission: {action}"
+            )
+
+
+def test_the_validator_has_no_aws_permissions_at_all(transformed):
+    """It only parses a string; anything else would be an unnecessary target."""
+    assert statements_for(transformed, "TriageValidateFunction") == []
+
+
+def test_only_the_state_machine_invokes_bedrock(transformed):
+    """The model is called by the optimised integration, not by a function."""
+    for logical_id in FUNCTION_LOGICAL_IDS:
+        for statement in statements_for(transformed, logical_id):
+            assert "bedrock:InvokeModel" not in actions_of(statement), (
+                f"{logical_id} can invoke a model directly"
+            )
+
+
+def test_the_enrichment_function_can_only_apply_the_guardrail(transformed):
+    bedrock_actions = set()
+    for statement in statements_for(transformed, "AiEnrichFunction"):
+        bedrock_actions.update(a for a in actions_of(statement) if a.startswith("bedrock:"))
+    assert bedrock_actions == {"bedrock:ApplyGuardrail"}
+
+
+def test_investigation_is_off_by_default(transformed):
+    assert transformed["Parameters"]["EnableGuardDutyInvestigation"]["Default"] == "false"
+
+
+def test_triage_temperature_defaults_to_zero(transformed):
+    """The same finding should produce the same summary; it is read as evidence."""
+    assert transformed["Parameters"]["TriageTemperature"]["Default"] == "0"

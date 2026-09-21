@@ -1,0 +1,45 @@
+{
+  "id": "malicious-dns-exfiltration",
+  "label": "malicious",
+  "expected_recommended_action": "escalate",
+  "notes": "DNS tunnelling. Survives security group isolation; only DNS Firewall closes it.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-malicious-dns-exfiltration",
+    "Type": "Trojan:EC2/DNSDataExfiltration",
+    "Severity": 8.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case malicious-dns-exfiltration",
+    "Description": "Synthetic finding for eval case malicious-dns-exfiltration.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-malicious-dns-exfiltration",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1,
+      "Action": {
+        "ActionType": "DNS_REQUEST",
+        "DnsRequestAction": {
+          "Domain": "aGVsbG8.exfil.example"
+        }
+      }
+    }
+  }
+}

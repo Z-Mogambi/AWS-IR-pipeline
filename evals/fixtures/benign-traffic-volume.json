@@ -1,0 +1,43 @@
+{
+  "id": "benign-traffic-volume",
+  "label": "benign",
+  "expected_recommended_action": "monitor",
+  "notes": "Unusual volume alone is frequently a backup window or a data migration.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-benign-traffic-volume",
+    "Type": "Behavior:EC2/TrafficVolumeUnusual",
+    "Severity": 2.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case benign-traffic-volume",
+    "Description": "Synthetic finding for eval case benign-traffic-volume.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-benign-traffic-volume",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "non-production"
+          },
+          {
+            "Key": "Name",
+            "Value": "batch-runner"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1
+    }
+  }
+}

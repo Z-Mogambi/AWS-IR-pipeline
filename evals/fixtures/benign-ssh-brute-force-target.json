@@ -1,0 +1,39 @@
+{
+  "id": "benign-ssh-brute-force-target",
+  "label": "benign",
+  "expected_recommended_action": "monitor",
+  "notes": "The instance is the target of brute forcing, not the actor.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-benign-ssh-brute-force-target",
+    "Type": "UnauthorizedAccess:EC2/SSHBruteForce",
+    "Severity": 2.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case benign-ssh-brute-force-target",
+    "Description": "Synthetic finding for eval case benign-ssh-brute-force-target.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-benign-ssh-brute-force-target",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "TARGET",
+      "Count": 1
+    }
+  }
+}

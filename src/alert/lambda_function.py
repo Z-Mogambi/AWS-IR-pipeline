@@ -60,18 +60,21 @@ def handler(event, context):
     enrichment = event.get("enrichment") or {}
     decision = event.get("decision") or {}
     containment = event.get("containment") or {}
+    triage = event.get("triage") or {}
     error = event.get("error") or {}
 
     environment = enrichment.get("environment", "unknown")
     instances = targets.get("instanceIds") or []
     instance_label = ", ".join(instances) if instances else "no actionable instance"
 
-    escalated = "[ESCALATED]" if decision.get("escalated") else ""
+    # Either the sequence indicators or a prompt attack inside the finding.
+    escalated = "[ESCALATED]" if (decision.get("escalated") or triage.get("escalated")) else ""
     subject = safe_subject(
         f"[{HEADLINE.get(kind, kind)}]{escalated}[{environment}] "
         f"{summary.get('type') or 'GuardDuty finding'} - {instance_label}"
     )
-    message = build_message(kind, event, summary, targets, enrichment, decision, containment, error)
+    message = build_message(kind, event, summary, targets, enrichment, decision, containment,
+                            triage, error)
 
     sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
     logger.info(f"Published {kind} notification for incident {event.get('incidentId')}")
@@ -79,7 +82,8 @@ def handler(event, context):
     return {"status": "SENT", "kind": kind, "subject": subject}
 
 
-def build_message(kind, event, summary, targets, enrichment, decision, containment, error):
+def build_message(kind, event, summary, targets, enrichment, decision, containment, triage,
+                  error):
     lines = [
         f"Incident:    {event.get('incidentId')}",
         f"Finding:     {event.get('findingId')}",
@@ -121,6 +125,8 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
     if decision.get("actions"):
         lines.append(f"  Planned actions: {', '.join(decision['actions'])}")
     lines.append("")
+
+    lines += triage_lines(triage)
 
     if kind == "VERIFY_FAILED":
         lines += [
@@ -170,6 +176,42 @@ def build_message(kind, event, summary, targets, enrichment, decision, containme
         lines.append("No containment was performed for this finding.")
 
     return "\n".join(lines)
+
+
+def triage_lines(triage):
+    """Render the model's view, clearly marked as advisory.
+
+    It is printed after the decision, never before, so a reader sees what the
+    pipeline did and why before they see what a model thought about it.
+    """
+    if not triage:
+        return []
+
+    if triage.get("escalated"):
+        return [
+            "AI TRIAGE: ESCALATED, NOT PERFORMED",
+            f"  {triage.get('reason')}",
+            "",
+        ]
+
+    if not triage.get("available"):
+        return [
+            "AI TRIAGE: unavailable",
+            f"  {triage.get('reason', 'no reason given')}",
+            "  This changes nothing: the decision above was made without it.",
+            "",
+        ]
+
+    return [
+        "AI TRIAGE (advisory - it did not influence the decision above)",
+        f"  Summary:      {triage.get('summary')}",
+        f"  Attack stage: {triage.get('attack_stage')}",
+        f"  Blast radius: {triage.get('blast_radius')}",
+        f"  Model suggests: {triage.get('recommended_action')} "
+        f"(confidence {triage.get('confidence')})",
+        f"  Rationale:    {triage.get('rationale')}",
+        "",
+    ]
 
 
 def sequence_lines(sequence, decision):

@@ -1,0 +1,56 @@
+{
+  "id": "malicious-crypto-miner",
+  "label": "malicious",
+  "expected_recommended_action": "contain",
+  "notes": "A miner executing on a production host.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-malicious-crypto-miner",
+    "Type": "Impact:Runtime/CryptoMinerExecuted",
+    "Severity": 8.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case malicious-crypto-miner",
+    "Description": "Synthetic finding for eval case malicious-crypto-miner.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-malicious-crypto-miner",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1,
+      "RuntimeDetails": {
+        "Process": {
+          "Name": "sh",
+          "ExecutablePath": "/bin/sh",
+          "Lineage": [
+            {
+              "Name": "xmrig"
+            },
+            {
+              "Name": "--donate-level=1"
+            },
+            {
+              "Name": "-o pool.example.invalid:3333"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

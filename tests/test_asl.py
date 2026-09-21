@@ -109,7 +109,10 @@ def test_substitutions_are_supplied_by_the_template(path):
     raw = path.read_text()
     used = set(re.findall(r"\$\{([A-Za-z0-9_]+)\}", raw))
     template = (ROOT / "template.yaml").read_text()
-    supplied = set(re.findall(r"^\s{8}([A-Za-z0-9_]+):\s*!GetAtt", template, re.MULTILINE))
+    # Substitutions are supplied with !GetAtt for ARNs and !Ref for plain values.
+    supplied = set(
+        re.findall(r"^\s{8}([A-Za-z0-9_]+):\s*!(?:GetAtt|Ref)\b", template, re.MULTILINE)
+    )
     missing = used - supplied
     assert not missing, f"{path.name} uses substitutions the template does not define: {missing}"
 

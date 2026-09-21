@@ -104,7 +104,295 @@
           "Next": "NotifyPipelineError"
         }
       ],
+      "Next": "ShouldTriage"
+    },
+    "ShouldTriage": {
+      "Type": "Choice",
+      "Comment": "Triage runs after the deterministic decision and before the notification, so the model can describe the incident but never shape the action set.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.decision.aiTriageEnabled",
+              "BooleanEquals": true
+            },
+            {
+              "Not": {
+                "Variable": "$.decision.decision",
+                "StringEquals": "IGNORE"
+              }
+            }
+          ],
+          "Next": "BuildTriageContext"
+        }
+      ],
+      "Default": "TriageSkipped"
+    },
+    "TriageSkipped": {
+      "Type": "Pass",
+      "Result": {
+        "available": false,
+        "advisory": true,
+        "reason": "AI triage is disabled, or the finding was ignored"
+      },
+      "ResultPath": "$.triage",
       "Next": "RouteDecision"
+    },
+    "BuildTriageContext": {
+      "Type": "Task",
+      "Comment": "Deterministic enrichment, sanitisation and the guardrail check. Produces the model payload.",
+      "Resource": "${AiEnrichFunctionArn}",
+      "ResultPath": "$.aiContext",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.triageError",
+          "Next": "TriageUnavailable"
+        }
+      ],
+      "Next": "GuardrailCheck"
+    },
+    "GuardrailCheck": {
+      "Type": "Choice",
+      "Comment": "A prompt attack inside a finding is itself a signal. The content is not sent to the model.",
+      "Choices": [
+        {
+          "Variable": "$.aiContext.escalated",
+          "BooleanEquals": true,
+          "Next": "TriageBlockedByGuardrail"
+        }
+      ],
+      "Default": "Triage"
+    },
+    "TriageBlockedByGuardrail": {
+      "Type": "Pass",
+      "Result": {
+        "available": false,
+        "advisory": true,
+        "escalated": true,
+        "reason": "The guardrail flagged a prompt attack inside this finding's own content, so it was not sent to the model."
+      },
+      "ResultPath": "$.triage",
+      "Next": "ShouldInvestigate"
+    },
+    "Triage": {
+      "Type": "Task",
+      "Comment": "Advisory only. The action set was fixed by Decide, upstream of here.",
+      "Resource": "arn:aws:states:::bedrock:invokeModel",
+      "Parameters": {
+        "ModelId": "${BedrockModelId}",
+        "Body.$": "$.aiContext.body",
+        "ContentType": "application/json",
+        "Accept": "application/json"
+      },
+      "ResultPath": "$.triageRaw",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Bedrock.ThrottlingException",
+            "Bedrock.ModelTimeoutException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.triageError",
+          "Next": "TriageUnavailable"
+        }
+      ],
+      "Next": "ValidateTriage"
+    },
+    "ValidateTriage": {
+      "Type": "Task",
+      "Comment": "Enforces the output contract. Anything malformed is discarded rather than shown.",
+      "Resource": "${TriageValidateFunctionArn}",
+      "Parameters": {
+        "triageRaw.$": "$.triageRaw"
+      },
+      "ResultPath": "$.triage",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.triageError",
+          "Next": "TriageUnavailable"
+        }
+      ],
+      "Next": "ShouldInvestigate"
+    },
+    "TriageUnavailable": {
+      "Type": "Pass",
+      "Comment": "Any failure in the chain above lands here. Triage is advisory, so the incident carries on to the same notification it would have had anyway.",
+      "Result": {
+        "available": false,
+        "advisory": true,
+        "reason": "triage did not complete; see $.triageError"
+      },
+      "ResultPath": "$.triage",
+      "Next": "ShouldInvestigate"
+    },
+    "ShouldInvestigate": {
+      "Type": "Choice",
+      "Comment": "Attack sequences only, and only when enabled. The preview API allows 10 investigations per account per day.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.decision.investigationEnabled",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.finding.targets.sequence",
+              "IsNull": false
+            }
+          ],
+          "Next": "StartInvestigation"
+        }
+      ],
+      "Default": "RouteDecision"
+    },
+    "StartInvestigation": {
+      "Type": "Task",
+      "Resource": "${InvestigateFunctionArn}",
+      "Parameters": {
+        "mode": "start",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "detectorId.$": "$.detectorId",
+        "finding.$": "$.finding"
+      },
+      "ResultPath": "$.investigation",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.investigationError",
+          "Next": "RouteDecision"
+        }
+      ],
+      "Next": "CheckInvestigation"
+    },
+    "CheckInvestigation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.investigation.available",
+          "BooleanEquals": false,
+          "Next": "RouteDecision"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.investigation.done",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.investigation.done",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "RouteDecision"
+        }
+      ],
+      "Default": "WaitForInvestigation"
+    },
+    "WaitForInvestigation": {
+      "Type": "Wait",
+      "Comment": "Bounded by MAX_POLLS in the function, so a stuck investigation cannot hold the execution open.",
+      "Seconds": 15,
+      "Next": "PollInvestigation"
+    },
+    "PollInvestigation": {
+      "Type": "Task",
+      "Resource": "${InvestigateFunctionArn}",
+      "Parameters": {
+        "mode": "poll",
+        "incidentId.$": "$.incidentId",
+        "region.$": "$.region",
+        "detectorId.$": "$.detectorId",
+        "finding.$": "$.finding",
+        "investigation.$": "$.investigation"
+      },
+      "ResultPath": "$.investigation",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.investigationError",
+          "Next": "RouteDecision"
+        }
+      ],
+      "Next": "CheckInvestigation"
     },
     "RouteDecision": {
       "Type": "Choice",
@@ -143,7 +431,8 @@
         "region.$": "$.region",
         "finding.$": "$.finding",
         "enrichment.$": "$.enrichment",
-        "decision.$": "$.decision"
+        "decision.$": "$.decision",
+        "triage.$": "$.triage"
       },
       "ResultPath": "$.notification",
       "TimeoutSeconds": 30,
@@ -175,7 +464,8 @@
           "region.$": "$.region",
           "finding.$": "$.finding",
           "enrichment.$": "$.enrichment",
-          "decision.$": "$.decision"
+          "decision.$": "$.decision",
+          "triage.$": "$.triage"
         }
       },
       "ResultPath": "$.approval",
@@ -221,7 +511,8 @@
         "region.$": "$.region",
         "finding.$": "$.finding",
         "enrichment.$": "$.enrichment",
-        "decision.$": "$.decision"
+        "decision.$": "$.decision",
+        "triage.$": "$.triage"
       },
       "ResultPath": "$.notification",
       "TimeoutSeconds": 30,
@@ -249,7 +540,8 @@
         "finding.$": "$.finding",
         "enrichment.$": "$.enrichment",
         "decision.$": "$.decision",
-        "error.$": "$.error"
+        "error.$": "$.error",
+        "triage.$": "$.triage"
       },
       "ResultPath": "$.notification",
       "TimeoutSeconds": 30,
@@ -480,7 +772,8 @@
         "finding.$": "$.finding",
         "enrichment.$": "$.enrichment",
         "decision.$": "$.decision",
-        "containment.$": "$.containment"
+        "containment.$": "$.containment",
+        "triage.$": "$.triage"
       },
       "ResultPath": "$.notification",
       "TimeoutSeconds": 30,
@@ -509,7 +802,8 @@
         "finding.$": "$.finding",
         "enrichment.$": "$.enrichment",
         "decision.$": "$.decision",
-        "error.$": "$.error"
+        "error.$": "$.error",
+        "triage.$": "$.triage"
       },
       "ResultPath": "$.notification",
       "TimeoutSeconds": 30,

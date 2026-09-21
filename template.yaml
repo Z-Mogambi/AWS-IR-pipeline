@@ -112,8 +112,44 @@ Parameters:
       iteration makes several EC2 and IAM calls, and the account-wide rate
       limits are shared with everything else running.
 
+  BedrockModelId:
+    Type: String
+    Default: ""
+    Description: >
+      Bedrock model id or inference profile id for AI triage. Leave empty to
+      disable triage entirely. The prompt is built in the Anthropic Messages
+      format, so this must be a Claude model - and newer Claude models on
+      Bedrock are only reachable through a cross-Region inference profile id,
+      not a bare model id. There is deliberately no default: a wrong model id
+      should fail loudly at deploy time, not silently pick something.
+
+  TriageMaxTokens:
+    Type: Number
+    Default: 1024
+    MinValue: 256
+    MaxValue: 4096
+    Description: Upper bound on triage output length.
+
+  TriageTemperature:
+    Type: String
+    Default: "0"
+    Description: >
+      Sampling temperature for triage. Kept at 0 so the same finding produces
+      the same summary, which matters when the output is read as evidence.
+
+  EnableGuardDutyInvestigation:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Call the GuardDuty Investigation preview API for attack sequences. Off by
+      default. Requires the AI_ANALYST detector feature, the delegated
+      administrator account, and one of the ten supported Regions; the quota is
+      10 investigations per account per day and 100 in total.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
+  HasAiTriage: !Not [!Equals [!Ref BedrockModelId, ""]]
 
 Globals:
   Function:
@@ -227,6 +263,25 @@ Resources:
           Action: BLOCK
           BlockResponse: NXDOMAIN
 
+  # Applied to the untrusted block before the model sees it. The Step Functions
+  # Bedrock integration has no documented guardrail field, so it is applied with
+  # ApplyGuardrail in the enrichment function instead.
+  TriageGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Condition: HasAiTriage
+    Properties:
+      Name: !Sub "${AWS::StackName}-triage"
+      Description: Prompt-attack filter for attacker-influenced finding content.
+      BlockedInputMessaging: Blocked by the incident response guardrail.
+      BlockedOutputsMessaging: Blocked by the incident response guardrail.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            # Prompt-attack filtering only applies to input; the output strength
+            # must be NONE for this filter type.
+            OutputStrength: NONE
+
   IncidentsTable:
     Type: AWS::DynamoDB::Table
     # The ledger is the only record of what was changed and how to change it
@@ -309,6 +364,8 @@ Resources:
         Variables:
           APPROVAL_TIMEOUT_SECONDS: !Ref ApprovalTimeoutSeconds
           APPROVAL_TIMEOUT_ACTION: !Ref ApprovalTimeoutAction
+          AI_TRIAGE_ENABLED: !If [HasAiTriage, "true", "false"]
+          ENABLE_GUARDDUTY_INVESTIGATION: !Ref EnableGuardDutyInvestigation
           MAX_AUTO_CONTAIN_INSTANCES: !Ref MaxAutoContainInstances
           CONTAINMENT_CONCURRENCY: !Ref ContainmentConcurrency
 
@@ -573,6 +630,71 @@ Resources:
                 - dynamodb:Query
               Resource: !GetAtt IncidentsTable.Arn
 
+  AiEnrichFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/aienrich/
+      Timeout: 120
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # Read-only. Blast radius is a question about what the role can
+              # do, never a reason to change it.
+              Action:
+                - iam:GetInstanceProfile
+                - iam:ListAttachedRolePolicies
+                - iam:ListRolePolicies
+                - iam:GetRolePolicy
+              Resource:
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*"
+        - Statement:
+            - Effect: Allow
+              # Neither action supports resource-level permissions.
+              Action:
+                - cloudtrail:LookupEvents
+                - inspector2:ListFindings
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:ApplyGuardrail
+              Resource: !If
+                - HasAiTriage
+                - !GetAtt TriageGuardrail.GuardrailArn
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+      Environment:
+        Variables:
+          GUARDRAIL_ID: !If [HasAiTriage, !GetAtt TriageGuardrail.GuardrailId, ""]
+          GUARDRAIL_VERSION: !If [HasAiTriage, !GetAtt TriageGuardrail.Version, "DRAFT"]
+          TRIAGE_MAX_TOKENS: !Ref TriageMaxTokens
+          TRIAGE_TEMPERATURE: !Ref TriageTemperature
+
+  TriageValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/triagevalidate/
+      Timeout: 30
+      # No policies at all: it only parses and validates a string.
+
+  InvestigateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/investigate/
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              # The preview API is absent from the runtime's bundled boto3, so
+              # the request is signed directly - but the IAM action is the same.
+              Action:
+                - guardduty:CreateInvestigation
+                - guardduty:GetInvestigation
+              Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
+      Environment:
+        Variables:
+          ENABLE_GUARDDUTY_INVESTIGATION: !Ref EnableGuardDutyInvestigation
+
   AlertFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -605,6 +727,10 @@ Resources:
         CredContainFunctionArn: !GetAtt CredContainFunction.Arn
         IdentityFunctionArn: !GetAtt IdentityFunction.Arn
         ImdsFunctionArn: !GetAtt ImdsFunction.Arn
+        AiEnrichFunctionArn: !GetAtt AiEnrichFunction.Arn
+        TriageValidateFunctionArn: !GetAtt TriageValidateFunction.Arn
+        BedrockModelId: !Ref BedrockModelId
+        InvestigateFunctionArn: !GetAtt InvestigateFunction.Arn
         AlertFunctionArn: !GetAtt AlertFunction.Arn
       Policies:
         - LambdaInvokePolicy:
@@ -623,6 +749,19 @@ Resources:
             FunctionName: !Ref IdentityFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref ImdsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AiEnrichFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TriageValidateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref InvestigateFunction
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              # Covers both a bare foundation model id and an inference profile.
+              Resource:
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
         - LambdaInvokePolicy:
             FunctionName: !Ref AlertFunction
 

@@ -1,0 +1,49 @@
+{
+  "id": "malicious-c2-dns",
+  "label": "malicious",
+  "expected_recommended_action": "contain",
+  "notes": "Classic command and control over DNS.",
+  "injection_vector": null,
+  "finding": {
+    "SchemaVersion": "2.0",
+    "Id": "eval-malicious-c2-dns",
+    "Type": "Backdoor:EC2/C&CActivity.B!DNS",
+    "Severity": 8.0,
+    "AccountId": "123456789012",
+    "Region": "us-east-1",
+    "Partition": "aws",
+    "Title": "Eval case malicious-c2-dns",
+    "Description": "EC2 instance i-0123456789abcdef0 is querying a domain name associated with a known Command and Control server.",
+    "CreatedAt": "2026-09-21T12:00:00.000Z",
+    "UpdatedAt": "2026-09-21T12:00:00.000Z",
+    "Arn": "arn:aws:guardduty:us-east-1:123456789012:detector/example/finding/eval-malicious-c2-dns",
+    "Resource": {
+      "ResourceType": "Instance",
+      "InstanceDetails": {
+        "InstanceId": "i-0123456789abcdef0",
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          },
+          {
+            "Key": "Name",
+            "Value": "web-01"
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Archived": false,
+      "DetectorId": "example",
+      "ResourceRole": "ACTOR",
+      "Count": 1,
+      "Action": {
+        "ActionType": "DNS_REQUEST",
+        "DnsRequestAction": {
+          "Domain": "c2.malware.example"
+        }
+      }
+    }
+  }
+}
