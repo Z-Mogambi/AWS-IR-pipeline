@@ -9,6 +9,7 @@ Nothing here contacts AWS: the transform is a pure function and the S3 URIs
 `sam package` would fill in are stubbed.
 """
 
+import json
 import pathlib
 
 import pytest
@@ -30,6 +31,9 @@ FUNCTION_LOGICAL_IDS = [
     "DecideFunction",
     "EvidenceFunction",
     "NetIsolateFunction",
+    "CredContainFunction",
+    "IdentityFunction",
+    "ImdsFunction",
     "AlertFunction",
 ]
 
@@ -165,11 +169,77 @@ def test_no_function_holds_managed_policies(transformed):
         assert not extra, f"{logical_id} carries managed policies: {extra}"
 
 
-def test_credential_containment_is_not_yet_granted_anywhere(transformed):
-    """iam:PutRolePolicy arrives in Phase 3, in one dedicated function only."""
-    for logical_id in FUNCTION_LOGICAL_IDS:
-        for statement in statements_for(transformed, logical_id):
-            assert "iam:PutRolePolicy" not in actions_of(statement)
+def test_only_one_function_can_write_an_inline_policy(transformed):
+    """iam:PutRolePolicy lives in exactly one small, single-purpose function."""
+    holders = [
+        logical_id
+        for logical_id in FUNCTION_LOGICAL_IDS
+        if any(
+            statement["Effect"] == "Allow" and "iam:PutRolePolicy" in actions_of(statement)
+            for statement in statements_for(transformed, logical_id)
+        )
+    ]
+    assert holders == ["CredContainFunction"]
+
+
+def test_the_pipeline_cannot_rewrite_its_own_roles(transformed):
+    """Defence in depth behind irlib.guard, at the IAM layer.
+
+    If the code-level protected-principal check were ever bypassed, IAM still
+    refuses PutRolePolicy against the stack's own roles and service-linked roles.
+    """
+    denies = [
+        statement
+        for statement in statements_for(transformed, "CredContainFunction")
+        if statement["Effect"] == "Deny" and "iam:PutRolePolicy" in actions_of(statement)
+    ]
+    assert denies, "the credential function must deny writing to the pipeline's own roles"
+    guarded = json.dumps(denies)
+    assert "aws-service-role" in guarded
+    assert "AWS::StackName" in guarded or "${AWS::StackName}" in guarded
+
+
+def test_only_the_state_machine_can_invoke_the_credential_function(transformed):
+    """No resource policy widens access to it beyond the state machine's role."""
+    permissions = resources_of(transformed, "AWS::Lambda::Permission")
+    for body in permissions.values():
+        target = json.dumps(body["Properties"]["FunctionName"])
+        assert "CredContain" not in target, (
+            "a resource policy on the credential function would let anything in the "
+            "account invoke it"
+        )
+
+
+def test_identity_containment_cannot_touch_roles(transformed):
+    """The identity function deactivates user keys; roles are the other function's job."""
+    for statement in statements_for(transformed, "IdentityFunction"):
+        if statement["Effect"] != "Allow":
+            continue
+        for action in actions_of(statement):
+            assert action not in ("iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:AttachRolePolicy")
+
+
+def test_identity_function_is_scoped_to_users(transformed):
+    for statement in statements_for(transformed, "IdentityFunction"):
+        if "iam:UpdateAccessKey" in actions_of(statement):
+            assert ":user/" in json.dumps(statement["Resource"])
+
+
+def test_access_key_findings_have_their_own_rule(transformed):
+    """Credential exfiltration and AI Protection carry resourceType AccessKey."""
+    rules = resources_of(transformed, "AWS::Events::Rule")
+    resource_types = set()
+    for body in rules.values():
+        pattern = body["Properties"]["EventPattern"]
+        resource_types.update(pattern["detail"]["resource"]["resourceType"])
+    assert resource_types == {"Instance", "AccessKey"}
+
+
+def test_every_eventbridge_rule_targets_only_the_router(transformed):
+    rules = resources_of(transformed, "AWS::Events::Rule")
+    for body in rules.values():
+        for target in body["Properties"]["Targets"]:
+            assert "RouterFunction" in json.dumps(target["Arn"])
 
 
 # --- durable state ----------------------------------------------------------
@@ -199,17 +269,18 @@ def test_the_state_machine_can_invoke_exactly_the_states_it_uses(transformed):
 
     # Router is deliberately absent: the state machine must not be able to
     # re-enter the pipeline.
-    assert len(invokable) == 6
+    assert len(invokable) == 9
     assert not any("RouterFunction" in entry for entry in invokable)
 
 
 def test_eventbridge_can_only_invoke_the_router_from_this_account(transformed):
     permissions = resources_of(transformed, "AWS::Lambda::Permission")
-    assert len(permissions) == 1
-    properties = list(permissions.values())[0]["Properties"]
-    assert properties["Principal"] == "events.amazonaws.com"
-    assert "SourceAccount" in properties, "confused-deputy guard is missing"
-    assert "SourceArn" in properties
+    assert len(permissions) == 2, "one permission per EventBridge rule"
+    for body in permissions.values():
+        properties = body["Properties"]
+        assert properties["Principal"] == "events.amazonaws.com"
+        assert "SourceAccount" in properties, "confused-deputy guard is missing"
+        assert "SourceArn" in properties
 
 
 # --- Phase 2 resources ------------------------------------------------------

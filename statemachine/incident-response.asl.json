@@ -192,7 +192,10 @@
       "Comment": "Seed the containment result so later ResultPaths have somewhere to write, and the notification states can reference it whichever steps ran.",
       "Result": {
         "evidence": null,
-        "network": null
+        "network": null,
+        "credentials": null,
+        "identity": null,
+        "imds": null
       },
       "ResultPath": "$.containment",
       "Next": "ShouldCollectEvidence"
@@ -247,7 +250,7 @@
           "Next": "IsolateNetwork"
         }
       ],
-      "Default": "NotifyContained"
+      "Default": "ShouldContainCredentials"
     },
     "IsolateNetwork": {
       "Type": "Task",
@@ -255,6 +258,119 @@
       "Resource": "${NetIsolateFunctionArn}",
       "ResultPath": "$.containment.network",
       "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyContainmentFailed"
+        }
+      ],
+      "Next": "ShouldContainCredentials"
+    },
+    "ShouldContainCredentials": {
+      "Type": "Choice",
+      "Comment": "Network isolation does nothing about credentials already stolen from the instance - the attacker is using them from their own machine.",
+      "Choices": [
+        {
+          "Variable": "$.decision.doCredentials",
+          "BooleanEquals": true,
+          "Next": "ContainCredentials"
+        }
+      ],
+      "Default": "ShouldDisableImds"
+    },
+    "ContainCredentials": {
+      "Type": "Task",
+      "Comment": "The only state that reaches the function holding iam:PutRolePolicy.",
+      "Resource": "${CredContainFunctionArn}",
+      "ResultPath": "$.containment.credentials",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyContainmentFailed"
+        }
+      ],
+      "Next": "ContainIdentity"
+    },
+    "ContainIdentity": {
+      "Type": "Task",
+      "Comment": "IAM user access keys only. The role paths are handled by the state above.",
+      "Resource": "${IdentityFunctionArn}",
+      "ResultPath": "$.containment.identity",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyContainmentFailed"
+        }
+      ],
+      "Next": "ShouldDisableImds"
+    },
+    "ShouldDisableImds": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision.doImds",
+          "BooleanEquals": true,
+          "Next": "DisableImds"
+        }
+      ],
+      "Default": "NotifyContained"
+    },
+    "DisableImds": {
+      "Type": "Task",
+      "Comment": "Last, because it also cuts off the SSM agent. Nothing can be run on the instance remotely after this.",
+      "Resource": "${ImdsFunctionArn}",
+      "ResultPath": "$.containment.imds",
+      "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [

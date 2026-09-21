@@ -16,7 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASL_DIR = ROOT / "statemachine"
 ASL_FILES = sorted(ASL_DIR.glob("*.asl.json"))
 
-CONTAINMENT_STATES = {"CollectEvidence", "IsolateNetwork"}
+CONTAINMENT_STATES = {"CollectEvidence", "IsolateNetwork", "ContainCredentials",
+                      "ContainIdentity", "DisableImds"}
 
 
 def load(path):
@@ -168,17 +169,37 @@ def test_every_task_has_a_timeout():
                 assert state.get("TimeoutSeconds"), f"{path.name}:{name} has no TimeoutSeconds"
 
 
-def test_containment_runs_evidence_before_network():
-    """The order the whole phase depends on.
+def test_containment_order_is_evidence_network_credentials_imds():
+    """The order the whole design depends on.
 
-    Isolation cuts off the SSM agent and makes an Auto Scaling group replace the
-    instance, so evidence collection and ASG detachment have to happen first.
+    Evidence first: isolation cuts off the SSM agent, and an Auto Scaling group
+    replaces an unreachable instance. IMDS last: disabling it also cuts off the
+    agent, so nothing can be run on the instance remotely afterwards.
     """
     states = load(ASL_DIR / "incident-response.asl.json")["States"]
-    after_evidence = reachable_from(states, "CollectEvidence")
-    after_network = reachable_from(states, "IsolateNetwork")
-    assert "IsolateNetwork" in after_evidence, "network isolation must follow evidence"
-    assert "CollectEvidence" not in after_network, "evidence must not follow isolation"
+    order = ["CollectEvidence", "IsolateNetwork", "ContainCredentials", "DisableImds"]
+    for earlier, later in zip(order, order[1:]):
+        assert later in reachable_from(states, earlier), f"{later} must be able to follow {earlier}"
+        assert earlier not in reachable_from(states, later), f"{earlier} must not follow {later}"
+
+
+def test_disabling_imds_is_the_last_containment_step():
+    """It cuts off the SSM agent, so nothing may need the instance after it."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    after = reachable_from(states, "DisableImds") - {"DisableImds"}
+    assert not (after & CONTAINMENT_STATES), (
+        f"containment continues after IMDS is disabled: {sorted(after & CONTAINMENT_STATES)}"
+    )
+
+
+def test_only_one_state_reaches_the_credential_containment_function():
+    """iam:PutRolePolicy is reachable from exactly one place in the machine."""
+    states = load(ASL_DIR / "incident-response.asl.json")["States"]
+    callers = [
+        name for name, body in states.items()
+        if body.get("Resource") == "${CredContainFunctionArn}"
+    ]
+    assert callers == ["ContainCredentials"]
 
 
 def test_containment_steps_are_individually_skippable():
@@ -187,6 +208,8 @@ def test_containment_steps_are_individually_skippable():
     for gate, action_flag, step in (
         ("ShouldCollectEvidence", "$.decision.doEvidence", "CollectEvidence"),
         ("ShouldIsolateNetwork", "$.decision.doNetwork", "IsolateNetwork"),
+        ("ShouldContainCredentials", "$.decision.doCredentials", "ContainCredentials"),
+        ("ShouldDisableImds", "$.decision.doImds", "DisableImds"),
     ):
         choice = states[gate]["Choices"][0]
         assert choice["Variable"] == action_flag

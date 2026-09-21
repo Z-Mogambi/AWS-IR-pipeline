@@ -98,22 +98,18 @@ def test_instance_credential_exfiltration_is_on_the_allowlist():
     assert result["ruleId"] == "auto-contain-instance-credential-exfiltration"
 
 
-def test_credential_exfiltration_carries_access_key_resource_type():
-    """Documents why that rule is unreachable until Phase 3.
+def test_credential_exfiltration_reaches_the_pipeline_via_the_access_key_rule():
+    """These findings carry resourceType AccessKey, not Instance.
 
-    These findings have resourceType AccessKey, so they never match the
-    EventBridge rule that filters on Instance. If this assertion ever fails
-    because the EC2 rule started matching them, the AccessKey branch in Phase 3
-    needs revisiting.
+    Conflict 1 in docs/UPGRADE_PROGRESS.md: the rule above was unreachable in
+    Phase 1 because the only EventBridge rule filtered on Instance. Phase 3
+    adds the AccessKey rule, so it is now live.
     """
-    import json
     import pathlib
 
     template = (pathlib.Path(__file__).resolve().parent.parent / "template.yaml").read_text()
-    assert "resourceType:\n              - Instance" in template
-    assert "AccessKey" not in template, (
-        "Phase 3 adds the AccessKey rule; update this test when it does."
-    )
+    assert "- Instance" in template
+    assert "- AccessKey" in template
 
 
 # --- strictness -------------------------------------------------------------

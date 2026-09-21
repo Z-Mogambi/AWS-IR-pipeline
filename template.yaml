@@ -64,6 +64,15 @@ Parameters:
       Priority for associating the DNS Firewall block rule group with a VPC.
       Must not collide with an existing association in the same VPC.
 
+  VerifyWrittenPolicies:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Read back every inline policy this pipeline writes and refuse it unless it
+      is a pure Deny. Leave on: it is the check that catches an Allow reaching a
+      role via the one function holding iam:PutRolePolicy.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
 
@@ -382,6 +391,89 @@ Resources:
           DNS_FIREWALL_RULE_GROUP_ID: !GetAtt QuarantineDnsRuleGroup.Id
           DNS_FIREWALL_PRIORITY: !Ref DnsFirewallRuleGroupPriority
 
+  CredContainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/credcontain/
+      Timeout: 60
+      # The only function in the stack with iam:PutRolePolicy. Nothing else may
+      # invoke it - only the state machine's role is granted lambda:InvokeFunction
+      # on it, and no resource policy widens that.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - iam:PutRolePolicy
+                - iam:GetRolePolicy
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+            - Effect: Deny
+              # Defence in depth behind irlib.guard: even if the code check were
+              # bypassed, IAM refuses to let the pipeline rewrite its own roles
+              # or any service-linked role.
+              Action:
+                - iam:PutRolePolicy
+                - iam:DeleteRolePolicy
+              Resource:
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-*"
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*"
+            - Effect: Allow
+              Action: iam:GetInstanceProfile
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*"
+        - Statement:
+            - Effect: Allow
+              # Re-derives the instance profile itself rather than trusting the
+              # enrichment state it was handed.
+              Action: ec2:DescribeInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
+      Environment:
+        Variables:
+          VERIFY_WRITTEN_POLICIES: !Ref VerifyWrittenPolicies
+
+  IdentityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/identity/
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - iam:UpdateAccessKey
+                - iam:ListAccessKeys
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
+
+  ImdsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/imds/
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ec2:ModifyInstanceMetadataOptions
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
+
   AlertFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -411,6 +503,9 @@ Resources:
         DecideFunctionArn: !GetAtt DecideFunction.Arn
         EvidenceFunctionArn: !GetAtt EvidenceFunction.Arn
         NetIsolateFunctionArn: !GetAtt NetIsolateFunction.Arn
+        CredContainFunctionArn: !GetAtt CredContainFunction.Arn
+        IdentityFunctionArn: !GetAtt IdentityFunction.Arn
+        ImdsFunctionArn: !GetAtt ImdsFunction.Arn
         AlertFunctionArn: !GetAtt AlertFunction.Arn
       Policies:
         - LambdaInvokePolicy:
@@ -423,6 +518,12 @@ Resources:
             FunctionName: !Ref EvidenceFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref NetIsolateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CredContainFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IdentityFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ImdsFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AlertFunction
 
@@ -444,6 +545,34 @@ Resources:
       Targets:
         - Arn: !GetAtt RouterFunction.Arn
           Id: RouterFunctionTarget
+
+  # Credential exfiltration and AI Protection findings carry resourceType
+  # AccessKey, not Instance, so they never match the rule above.
+  GuardDutyAccessKeyFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: GuardDuty findings against access keys and role sessions.
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          resource:
+            resourceType:
+              - AccessKey
+      Targets:
+        - Arn: !GetAtt RouterFunction.Arn
+          Id: RouterFunctionAccessKeyTarget
+
+  InvokeRouterFromAccessKeyRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RouterFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt GuardDutyAccessKeyFindingRule.Arn
 
   InvokeRouterPermission:
     Type: AWS::Lambda::Permission
