@@ -2,7 +2,37 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   incident-response-pipeline
-  SAM template for a serverless incident response pipeline for GuardDuty findings.
+  Serverless incident response for GuardDuty findings: verify, decide against a
+  versioned response policy, then notify or contain, recording every action
+  write-ahead so it can be released later.
+
+Parameters:
+  AccountEnvironmentMap:
+    Type: String
+    Default: ""
+    Description: >
+      Optional "accountId=environment" list, comma separated, for example
+      "111122223333=non-production,444455556666=production". Valid environments
+      are production and non-production. This overrides the Environment tag,
+      because an account is much harder for an attacker to change than a tag.
+
+  ProtectedRoleNames:
+    Type: String
+    Default: ""
+    Description: >
+      Comma separated IAM role names the pipeline must never modify - your
+      break-glass and administrator roles. The pipeline's own roles and all
+      service-linked roles are protected automatically.
+
+  AlertEmailEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email address to subscribe to the alerts topic. Leave empty to
+      manage subscriptions yourself. Without a subscriber, alerts go nowhere.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, ""]]
 
 Globals:
   Function:
@@ -11,121 +41,206 @@ Globals:
     Runtime: python3.14
     Architectures:
       - x86_64
+    Handler: lambda_function.handler
+    Layers:
+      - !Ref CommonLayer
+    Environment:
+      Variables:
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        ACCOUNT_ENVIRONMENT_MAP: !Ref AccountEnvironmentMap
+        PROTECTED_ROLE_NAMES: !Ref ProtectedRoleNames
+        # SAM names every function role "<stack>-<Function>Role-<suffix>", so this
+        # prefix lets irlib.guard recognise the pipeline's own roles.
+        PIPELINE_ROLE_PREFIX: !Sub "${AWS::StackName}-"
 
 Resources:
+  # ------------------------------------------------------------------ shared
+
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-irlib"
+      Description: Shared incident response helpers and the versioned response policy.
+      ContentUri: layers/common/
+      CompatibleRuntimes:
+        - python3.14
+      RetentionPolicy: Delete
+
   AlertsSNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       DisplayName: Incident Response Alerts
 
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsSNSTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailEndpoint
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    # The ledger is the only record of what was changed and how to change it
+    # back. Losing it with the stack would strand every contained instance.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: IncidentId
+          AttributeType: S
+        - AttributeName: RecordId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: IncidentId
+          KeyType: HASH
+        - AttributeName: RecordId
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # --------------------------------------------------------------- functions
+  # One role per function, created by SAM from the Policies block below. Each
+  # holds only what that function calls. EC2 Describe actions do not support
+  # resource-level permissions, so those statements use "*" by necessity;
+  # every mutating action is scoped to a resource ARN.
+
   RouterFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/router/
-      Handler: lambda_function.handler
       Policies:
+        # The only role in the stack allowed to start an execution.
         - StepFunctionsExecutionPolicy:
             StateMachineName: !GetAtt IncidentResponseStateMachine.Name
       Environment:
         Variables:
           SFN_STATE_MACHINE_ARN: !Ref IncidentResponseStateMachine
 
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/verify/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: guardduty:GetFindings
+              Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+              Resource: !GetAtt IncidentsTable.Arn
+
   EnrichFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/enrich/
-      Handler: lambda_function.handler
       Policies:
-        # For production, it is better to use a more restrictive custom policy
-        # instead of the AWS managed policy.
-        - AmazonEC2ReadOnlyAccess
+        - Statement:
+            - Effect: Allow
+              # ec2:DescribeInstances does not support resource-level
+              # permissions; "*" is the narrowest this action can be written.
+              Action: ec2:DescribeInstances
+              Resource: "*"
+
+  DecideFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/decide/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
 
   IsolateFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/isolate/
-      Handler: lambda_function.handler
+      Timeout: 120
       Policies:
         - Statement:
-          - Effect: Allow
-            Action:
-              - ec2:DescribeInstances
-              - ec2:DescribeSecurityGroups
-              - ec2:CreateSecurityGroup
-              - ec2:RevokeSecurityGroupEgress
-              - ec2:ModifyInstanceAttribute
-            # For production, this should be scoped down to specific resources if possible.
-            Resource: "*"
+            - Effect: Allow
+              Action:
+                - ec2:DescribeSecurityGroups
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateSecurityGroup
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+            - Effect: Allow
+              Action:
+                - ec2:RevokeSecurityGroupEgress
+              Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+            - Effect: Allow
+              Action:
+                - ec2:ModifyInstanceAttribute
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentsTable.Arn
 
   AlertFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/alert/
-      Handler: lambda_function.handler
       Policies:
         - SNSPublishMessagePolicy:
             TopicName: !GetAtt AlertsSNSTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              # Reads the write-ahead ledger so a partial-failure alert reports
+              # what actually completed rather than what was intended.
+              Action: dynamodb:Query
+              Resource: !GetAtt IncidentsTable.Arn
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref AlertsSNSTopic
 
+  # ----------------------------------------------------------- orchestration
+
   IncidentResponseStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Definition:
-        Comment: "Orchestrates incident response for GuardDuty findings on EC2 instances"
-        StartAt: EnrichFinding
-        States:
-          EnrichFinding:
-            Type: Task
-            Resource: !GetAtt EnrichFunction.Arn
-            Next: IsProductionCheck
-            Catch:
-              - ErrorEquals: ["States.ALL"]
-                Next: FailState
-          IsProductionCheck:
-            Type: Choice
-            Choices:
-              - Variable: "$.IsProduction"
-                BooleanEquals: true
-                Next: IsolateAndAlert
-            Default: NonProdAlert
-          IsolateAndAlert:
-            Type: Parallel
-            Branches:
-              - StartAt: IsolateInstance
-                States:
-                  IsolateInstance:
-                    Type: Task
-                    Resource: !GetAtt IsolateFunction.Arn
-                    End: true
-              - StartAt: SendAlert
-                States:
-                  SendAlert:
-                    Type: Task
-                    Resource: !GetAtt AlertFunction.Arn
-                    End: true
-            Next: SuccessState
-          NonProdAlert:
-            Type: Task
-            Resource: !GetAtt AlertFunction.Arn
-            Next: SuccessState
-          SuccessState:
-            Type: Succeed
-          FailState:
-            Type: Fail
+      DefinitionUri: statemachine/incident-response.asl.json
+      DefinitionSubstitutions:
+        VerifyFunctionArn: !GetAtt VerifyFunction.Arn
+        EnrichFunctionArn: !GetAtt EnrichFunction.Arn
+        DecideFunctionArn: !GetAtt DecideFunction.Arn
+        IsolateFunctionArn: !GetAtt IsolateFunction.Arn
+        AlertFunctionArn: !GetAtt AlertFunction.Arn
       Policies:
         - LambdaInvokePolicy:
+            FunctionName: !Ref VerifyFunction
+        - LambdaInvokePolicy:
             FunctionName: !Ref EnrichFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DecideFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref IsolateFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AlertFunction
 
-  GuardDutyFindingRule:
+  # ------------------------------------------------------------------ events
+
+  GuardDutyInstanceFindingRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: "Rule to capture GuardDuty EC2 findings and trigger the router"
+      Description: GuardDuty findings against EC2 instances.
       EventPattern:
         source:
           - aws.guardduty
@@ -137,7 +252,7 @@ Resources:
               - Instance
       Targets:
         - Arn: !GetAtt RouterFunction.Arn
-          Id: "RouterFunctionTarget"
+          Id: RouterFunctionTarget
 
   InvokeRouterPermission:
     Type: AWS::Lambda::Permission
@@ -145,12 +260,16 @@ Resources:
       FunctionName: !GetAtt RouterFunction.Arn
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt GuardDutyFindingRule.Arn
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt GuardDutyInstanceFindingRule.Arn
 
 Outputs:
   StateMachineArn:
-    Description: "ARN of the Incident Response State Machine"
+    Description: ARN of the incident response state machine.
     Value: !Ref IncidentResponseStateMachine
   AlertsSNSTopicArn:
-    Description: "ARN of the SNS topic for alerts"
+    Description: ARN of the alerts topic. Subscribe to it or alerts go nowhere.
     Value: !Ref AlertsSNSTopic
+  IncidentsTableName:
+    Description: DynamoDB table holding the write-ahead incident ledger.
+    Value: !Ref IncidentsTable

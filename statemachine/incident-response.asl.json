@@ -1,0 +1,339 @@
+{
+  "Comment": "GuardDuty incident response. Verify the finding, establish the environment, apply the response policy, then notify or contain. Containment order is fixed by this file, not by the policy.",
+  "StartAt": "VerifyFinding",
+  "States": {
+    "VerifyFinding": {
+      "Type": "Task",
+      "Comment": "Re-fetch the finding from GuardDuty. Everything downstream is derived from what this returns, never from the EventBridge payload.",
+      "Resource": "${VerifyFunctionArn}",
+      "ResultPath": "$.finding",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyVerifyFailed"
+        }
+      ],
+      "Next": "EnrichInstance"
+    },
+
+    "EnrichInstance": {
+      "Type": "Task",
+      "Comment": "Best effort. On failure the Catch below substitutes a production-by-default result so the run still reaches a decision and a notification.",
+      "Resource": "${EnrichFunctionArn}",
+      "ResultPath": "$.enrichment",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.enrichmentError",
+          "Next": "EnrichmentUnavailable"
+        }
+      ],
+      "Next": "Decide"
+    },
+
+    "EnrichmentUnavailable": {
+      "Type": "Pass",
+      "Comment": "Enrichment failed outright. Fall back to production, which is the stricter of the two, and carry on to the decision.",
+      "Result": {
+        "environment": "production",
+        "environmentSource": "default-enrichment-failed",
+        "instance": null,
+        "errors": ["The enrichment state failed; see $.enrichmentError."]
+      },
+      "ResultPath": "$.enrichment",
+      "Next": "Decide"
+    },
+
+    "Decide": {
+      "Type": "Task",
+      "Comment": "The only place a containment decision is made. Deliberately ahead of the Phase 6 AI triage.",
+      "Resource": "${DecideFunctionArn}",
+      "ResultPath": "$.decision",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineError"
+        }
+      ],
+      "Next": "RouteDecision"
+    },
+
+    "RouteDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.decision.decision",
+          "StringEquals": "IGNORE",
+          "Next": "RecordIgnored"
+        },
+        {
+          "Variable": "$.decision.decision",
+          "StringEquals": "AUTO_CONTAIN",
+          "Next": "ContainInstance"
+        },
+        {
+          "Variable": "$.decision.decision",
+          "StringEquals": "APPROVAL_REQUIRED",
+          "Next": "NotifyApprovalRequired"
+        }
+      ],
+      "Default": "NotifyOnly"
+    },
+
+    "RecordIgnored": {
+      "Type": "Pass",
+      "Comment": "Below the notification threshold. The incident record still exists.",
+      "End": true
+    },
+
+    "NotifyOnly": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "NOTIFY",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "decision.$": "$.decision"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+
+    "NotifyApprovalRequired": {
+      "Type": "Task",
+      "Comment": "Phase 4 turns this into a .waitForTaskToken callback. For now it only notifies; nothing is contained.",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "APPROVAL_REQUIRED",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "decision.$": "$.decision"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+
+    "ContainInstance": {
+      "Type": "Task",
+      "Comment": "Phase 2 replaces this single task with evidence -> network -> credentials -> IMDS, in that order.",
+      "Resource": "${IsolateFunctionArn}",
+      "ResultPath": "$.containment",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyContainmentFailed"
+        }
+      ],
+      "Next": "NotifyContained"
+    },
+
+    "NotifyContained": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "CONTAINED",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "decision.$": "$.decision",
+        "containment.$": "$.containment"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+
+    "NotifyContainmentFailed": {
+      "Type": "Task",
+      "Comment": "Partial containment. Nothing is rolled back; the alert reports from the ledger exactly which actions completed.",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "CONTAINMENT_FAILED",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "decision.$": "$.decision",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "ContainmentIncomplete"
+    },
+
+    "NotifyVerifyFailed": {
+      "Type": "Task",
+      "Comment": "The finding was missing, archived, or did not match its identifiers. No action taken.",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "VERIFY_FAILED",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "NotVerified"
+    },
+
+    "NotifyPipelineError": {
+      "Type": "Task",
+      "Resource": "${AlertFunctionArn}",
+      "Parameters": {
+        "notifyKind": "PIPELINE_ERROR",
+        "incidentId.$": "$.incidentId",
+        "findingId.$": "$.findingId",
+        "accountId.$": "$.accountId",
+        "region.$": "$.region",
+        "finding.$": "$.finding",
+        "enrichment.$": "$.enrichment",
+        "error.$": "$.error"
+      },
+      "ResultPath": "$.notification",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "NotVerified": {
+      "Type": "Fail",
+      "Error": "FindingNotVerified",
+      "Cause": "The finding could not be re-fetched, or was archived. A notification was sent."
+    },
+
+    "ContainmentIncomplete": {
+      "Type": "Fail",
+      "Error": "ContainmentIncomplete",
+      "Cause": "Containment did not finish. Nothing was rolled back; see the incident record."
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "The pipeline failed before reaching a decision. A notification was sent."
+    }
+  }
+}

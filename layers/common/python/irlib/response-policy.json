@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "updated": "2026-09-21",
+  "description": "Deterministic response policy. Rules are evaluated in order and the first match wins; if nothing matches, `fallback` applies. Every finding type named here was confirmed verbatim against the GuardDuty finding-type documentation - do not add a type without checking its spelling there.",
+
+  "severityBands": {
+    "low": {"min": 1.0, "max": 3.9},
+    "medium": {"min": 4.0, "max": 6.9},
+    "high": {"min": 7.0, "max": 8.9},
+    "critical": {"min": 9.0, "max": 10.0}
+  },
+
+  "environmentTagKey": "Environment",
+  "environmentTagValues": {
+    "production": ["production", "prod"],
+    "non-production": ["non-production", "nonproduction", "non-prod", "nonprod", "dev", "development", "test", "testing", "staging", "stage", "qa", "sandbox"]
+  },
+  "unknownEnvironment": "production",
+
+  "containmentActions": {
+    "evidence": "Preserve the finding, instance metadata, snapshots and protection flags.",
+    "network": "Per-incident quarantine security group applied to every ENI.",
+    "credentials": "Deny the instance role's credentials via an ec2:SourceInstanceARN condition.",
+    "imds": "Disable the instance metadata endpoint. Always last - it also cuts off the SSM agent."
+  },
+  "actionOrderNote": "The order of containment actions is fixed by the state machine (evidence -> network -> credentials -> imds), not by the order of the `actions` list. The list is a set of enabled actions.",
+
+  "rules": [
+    {
+      "id": "auto-contain-high-confidence",
+      "description": "Types where the finding itself is strong evidence of an active compromise: command and control, cryptocurrency mining, DNS exfiltration and runtime reverse shells. Contained in every environment.",
+      "match": {
+        "type": [
+          "Backdoor:EC2/C&CActivity.B",
+          "Backdoor:EC2/C&CActivity.B!DNS",
+          "Backdoor:Runtime/C&CActivity.B",
+          "Backdoor:Runtime/C&CActivity.B!DNS",
+          "CryptoCurrency:EC2/BitcoinTool.B",
+          "CryptoCurrency:EC2/BitcoinTool.B!DNS",
+          "CryptoCurrency:Runtime/BitcoinTool.B",
+          "CryptoCurrency:Runtime/BitcoinTool.B!DNS",
+          "Impact:Runtime/CryptoMinerExecuted",
+          "Execution:Runtime/ReverseShell",
+          "Trojan:EC2/DNSDataExfiltration"
+        ]
+      },
+      "decision": "AUTO_CONTAIN",
+      "actions": ["evidence", "network", "credentials", "imds"]
+    },
+    {
+      "id": "auto-contain-instance-credential-exfiltration",
+      "description": "Instance role credentials in use from outside the instance. NOTE: these findings carry resourceType AccessKey, not Instance, so they only reach the pipeline through the AccessKey EventBridge rule added in Phase 3. Until then this rule is unreachable and a test asserts that.",
+      "match": {
+        "type": [
+          "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS",
+          "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS"
+        ]
+      },
+      "decision": "AUTO_CONTAIN",
+      "actions": ["evidence", "network", "credentials", "imds"]
+    },
+    {
+      "id": "auto-contain-attack-sequence",
+      "description": "Extended Threat Detection attack sequences are always critical severity. Phase 5 caps how many instances a single sequence may contain automatically (MaxAutoContainInstances); above the cap the sequence goes to approval instead.",
+      "match": {"typePrefix": ["AttackSequence:"]},
+      "decision": "AUTO_CONTAIN",
+      "actions": ["evidence", "network", "credentials", "imds"]
+    },
+    {
+      "id": "ai-protection-cost-harvesting",
+      "description": "Cost harvesting burns real money, so it warrants a human decision rather than a notification.",
+      "match": {"type": ["Impact:IAMUser/CostHarvesting"]},
+      "decision": "APPROVAL_REQUIRED",
+      "actions": ["credentials"]
+    },
+    {
+      "id": "ai-protection-notify",
+      "description": "Remaining GuardDuty AI Protection findings notify by default.",
+      "match": {
+        "type": [
+          "Impact:IAMUser/AnomalousModelInvocation",
+          "Impact:IAMUser/PromptInjection.Direct"
+        ]
+      },
+      "decision": "NOTIFY",
+      "actions": []
+    },
+    {
+      "id": "notify-inbound-recon",
+      "description": "The instance is the TARGET of probing from the internet, not the actor. Anyone on the internet can trigger Recon:EC2/PortProbeUnprotectedPort against an open port, so containing on it would hand an outsider a denial-of-service button. The same types with resourceRole ACTOR mean the instance is doing the scanning and deliberately fall through to the defaults below.",
+      "match": {
+        "type": [
+          "Recon:EC2/PortProbeUnprotectedPort",
+          "Recon:EC2/PortProbeEMRUnprotectedPort",
+          "UnauthorizedAccess:EC2/SSHBruteForce",
+          "UnauthorizedAccess:EC2/RDPBruteForce"
+        ],
+        "resourceRole": ["TARGET"]
+      },
+      "decision": "NOTIFY",
+      "actions": []
+    },
+    {
+      "id": "notify-low-severity",
+      "description": "Low severity means attempted but unsuccessful activity. Notify, never contain.",
+      "match": {"severityMax": 3.9},
+      "decision": "NOTIFY",
+      "actions": []
+    },
+    {
+      "id": "approval-identity-default",
+      "description": "Every remaining identity action needs a human. Disabling the wrong key or denying the wrong role breaks production instantly and is not self-healing.",
+      "match": {"resourceType": ["AccessKey"]},
+      "decision": "APPROVAL_REQUIRED",
+      "actions": ["credentials"]
+    },
+    {
+      "id": "default-non-production-medium-plus",
+      "description": "Outside production, medium severity and above is contained automatically - the blast radius of a wrong call is a developer environment.",
+      "match": {"environment": ["non-production"], "severityMin": 4.0},
+      "decision": "AUTO_CONTAIN",
+      "actions": ["evidence", "network", "credentials", "imds"]
+    },
+    {
+      "id": "default-production",
+      "description": "In production, anything not on the high-confidence allowlist waits for a human.",
+      "match": {"environment": ["production"]},
+      "decision": "APPROVAL_REQUIRED",
+      "actions": ["evidence", "network", "credentials", "imds"]
+    }
+  ],
+
+  "fallback": {
+    "decision": "NOTIFY",
+    "actions": [],
+    "description": "Nothing matched. Notify a human rather than guess."
+  }
+}
