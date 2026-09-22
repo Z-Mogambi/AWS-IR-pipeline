@@ -116,3 +116,39 @@ def test_dev_requirements_are_not_installed_into_a_function():
     """They exist for the test runner, never for a bundle."""
     for path in (ROOT / "src").rglob("*"):
         assert path.name != "requirements-dev.txt"
+
+
+# --- files that must stay local ---------------------------------------------
+
+LOCAL_ONLY = ("UPGRADE_PROMPT.md", "check-teardown.sh")
+
+
+def tracked_files():
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout
+    return set(out.split())
+
+
+@pytest.mark.parametrize("name", LOCAL_ONLY)
+def test_local_only_files_are_never_tracked(name):
+    """These must not reach the remote.
+
+    UPGRADE_PROMPT.md is a private spec; check-teardown.sh runs against a real
+    AWS account. Both are in .gitignore, but a `git add -f` would bypass that,
+    so this fails the build instead.
+    """
+    assert name not in tracked_files(), (
+        f"{name} is tracked and would be pushed. Run: git rm --cached {name}"
+    )
+
+
+@pytest.mark.parametrize("name", LOCAL_ONLY)
+def test_local_only_files_are_gitignored(name):
+    """Belt and braces: the ignore rule is what stops a blanket `git add -A`."""
+    ignored = (ROOT / ".gitignore").read_text().splitlines()
+    assert name in [line.strip() for line in ignored], (
+        f"{name} is missing from .gitignore"
+    )

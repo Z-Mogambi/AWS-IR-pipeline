@@ -4,3 +4,9 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local-only, deliberately never committed or pushed.
+# UPGRADE_PROMPT.md is the private upgrade spec; check-teardown.sh is an
+# operational sweep that runs against a real AWS account.
+UPGRADE_PROMPT.md
+check-teardown.sh
