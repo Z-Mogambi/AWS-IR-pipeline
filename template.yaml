@@ -705,8 +705,11 @@ Resources:
         - Statement:
             - Effect: Allow
               # Reads the write-ahead ledger so a partial-failure alert reports
-              # what actually completed rather than what was intended.
-              Action: dynamodb:Query
+              # what actually completed rather than what was intended, and
+              # records the measured time-to-contain on the incident.
+              Action:
+                - dynamodb:Query
+                - dynamodb:UpdateItem
               Resource: !GetAtt IncidentsTable.Arn
       Environment:
         Variables:
@@ -862,6 +865,230 @@ Resources:
       Principal: events.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt GuardDutyInstanceFindingRule.Arn
+
+  IrPipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-incident-response"
+      DashboardBody: !Sub |
+          {
+            "widgets": [
+              {
+                "type": "text",
+                "x": 0,
+                "y": 0,
+                "width": 24,
+                "height": 3,
+                "properties": {
+                  "markdown": "# Incident response pipeline\n\nBoth timings are measured from the GuardDuty finding's own `createdAt`, so they include GuardDuty's detection and delivery latency as well as this pipeline's. That is usually the larger part and is not something the pipeline controls - but it is the number that reflects how long an attacker actually had.\n\n`TimeToContainSeconds` is taken from the incident ledger's last completed containment action, not from when the email was sent."
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 3,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "Time to contain, by environment",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "metrics": [
+                    [
+                      "IRPipeline",
+                      "TimeToContainSeconds",
+                      "Environment",
+                      "production",
+                      {
+                        "stat": "p50",
+                        "label": "prod p50"
+                      }
+                    ],
+                    [
+                      "...",
+                      {
+                        "stat": "p90",
+                        "label": "prod p90"
+                      }
+                    ],
+                    [
+                      "IRPipeline",
+                      "TimeToContainSeconds",
+                      "Environment",
+                      "non-production",
+                      {
+                        "stat": "p50",
+                        "label": "non-prod p50"
+                      }
+                    ]
+                  ],
+                  "yAxis": {
+                    "left": {
+                      "label": "Seconds",
+                      "showUnits": false,
+                      "min": 0
+                    }
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12,
+                "y": 3,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "Time to notify, by environment",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "metrics": [
+                    [
+                      "IRPipeline",
+                      "TimeToNotifySeconds",
+                      "Environment",
+                      "production",
+                      {
+                        "stat": "p50",
+                        "label": "prod p50"
+                      }
+                    ],
+                    [
+                      "...",
+                      {
+                        "stat": "p90",
+                        "label": "prod p90"
+                      }
+                    ],
+                    [
+                      "IRPipeline",
+                      "TimeToNotifySeconds",
+                      "Environment",
+                      "non-production",
+                      {
+                        "stat": "p50",
+                        "label": "non-prod p50"
+                      }
+                    ]
+                  ],
+                  "yAxis": {
+                    "left": {
+                      "label": "Seconds",
+                      "showUnits": false,
+                      "min": 0
+                    }
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 9,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "State machine executions",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "metrics": [
+                    [
+                      "AWS/States",
+                      "ExecutionsStarted",
+                      "StateMachineArn",
+                      "${IncidentResponseStateMachine}",
+                      {
+                        "stat": "Sum"
+                      }
+                    ],
+                    [
+                      "AWS/States",
+                      "ExecutionsSucceeded",
+                      "StateMachineArn",
+                      "${IncidentResponseStateMachine}",
+                      {
+                        "stat": "Sum"
+                      }
+                    ],
+                    [
+                      "AWS/States",
+                      "ExecutionsFailed",
+                      "StateMachineArn",
+                      "${IncidentResponseStateMachine}",
+                      {
+                        "stat": "Sum"
+                      }
+                    ],
+                    [
+                      "AWS/States",
+                      "ExecutionsTimedOut",
+                      "StateMachineArn",
+                      "${IncidentResponseStateMachine}",
+                      {
+                        "stat": "Sum"
+                      }
+                    ]
+                  ]
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12,
+                "y": 9,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "Containment function errors",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "metrics": [
+                    [
+                      "AWS/Lambda",
+                      "Errors",
+                      "FunctionName",
+                      "${EvidenceFunction}",
+                      {
+                        "stat": "Sum",
+                        "label": "evidence"
+                      }
+                    ],
+                    [
+                      "AWS/Lambda",
+                      "Errors",
+                      "FunctionName",
+                      "${NetIsolateFunction}",
+                      {
+                        "stat": "Sum",
+                        "label": "network"
+                      }
+                    ],
+                    [
+                      "AWS/Lambda",
+                      "Errors",
+                      "FunctionName",
+                      "${CredContainFunction}",
+                      {
+                        "stat": "Sum",
+                        "label": "credentials"
+                      }
+                    ],
+                    [
+                      "AWS/Lambda",
+                      "Errors",
+                      "FunctionName",
+                      "${ImdsFunction}",
+                      {
+                        "stat": "Sum",
+                        "label": "imds"
+                      }
+                    ]
+                  ]
+                }
+              }
+            ]
+          }
 
 Outputs:
   StateMachineArn:

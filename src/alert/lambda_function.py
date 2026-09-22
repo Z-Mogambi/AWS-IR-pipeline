@@ -17,7 +17,7 @@ import os
 
 import boto3
 
-from irlib import incidents
+from irlib import incidents, metrics
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -79,7 +79,45 @@ def handler(event, context):
     sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
     logger.info(f"Published {kind} notification for incident {event.get('incidentId')}")
 
-    return {"status": "SENT", "kind": kind, "subject": subject}
+    timings = record_timings(event, kind, summary, environment)
+    return {"status": "SENT", "kind": kind, "subject": subject, "timings": timings}
+
+
+def record_timings(event, kind, summary, environment):
+    """Measure from the finding's createdAt, and record it on the incident.
+
+    Both figures include GuardDuty's own detection and delivery latency, which
+    is usually the largest part of the total and is not something this pipeline
+    controls. That is the honest number: a responder cares how long the
+    attacker had, not how fast the state machine ran.
+
+    Never raises - a metric must not cost a notification that already went out.
+    """
+    incident_id = event.get("incidentId")
+    created_at = summary.get("createdAt")
+    timings = {}
+
+    try:
+        timings[metrics.TIME_TO_NOTIFY] = metrics.seconds_between(created_at)
+
+        if kind in ("CONTAINED", "CONTAINMENT_FAILED") and incident_id:
+            finished = metrics.containment_completed_at(incidents.list_actions(incident_id))
+            timings[metrics.TIME_TO_CONTAIN] = metrics.seconds_between(created_at, finished)
+
+        metrics.emit(
+            timings,
+            environment=environment,
+            finding_type=summary.get("type"),
+            extra={"incidentId": incident_id, "notifyKind": kind},
+        )
+
+        measured = {k: v for k, v in timings.items() if v is not None}
+        if measured and incident_id:
+            incidents.update_incident(incident_id, {"Timings": measured})
+        return measured
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not record timings for {incident_id}: {exc}")
+        return timings
 
 
 def build_message(kind, event, summary, targets, enrichment, decision, containment, triage,
