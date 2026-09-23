@@ -101,9 +101,9 @@ def test_instance_credential_exfiltration_is_on_the_allowlist():
 def test_credential_exfiltration_reaches_the_pipeline_via_the_access_key_rule():
     """These findings carry resourceType AccessKey, not Instance.
 
-    Conflict 1 in docs/UPGRADE_PROGRESS.md: the rule above was unreachable in
-    Phase 1 because the only EventBridge rule filtered on Instance. Phase 3
-    adds the AccessKey rule, so it is now live.
+    The rule above was once unreachable: the only EventBridge rule filtered on
+    Instance, which these findings never match. The AccessKey rule makes it
+    live.
     """
     import pathlib
 

@@ -120,7 +120,12 @@ def test_dev_requirements_are_not_installed_into_a_function():
 
 # --- files that must stay local ---------------------------------------------
 
-LOCAL_ONLY = ("UPGRADE_PROMPT.md", "check-teardown.sh")
+LOCAL_ONLY = (
+    "UPGRADE_PROMPT.md",
+    "check-teardown.sh",
+    "docs/TESTING.md",
+    "docs/UPGRADE_PROGRESS.md",
+)
 
 
 def tracked_files():
@@ -136,9 +141,10 @@ def tracked_files():
 def test_local_only_files_are_never_tracked(name):
     """These must not reach the remote.
 
-    UPGRADE_PROMPT.md is a private spec; check-teardown.sh runs against a real
-    AWS account. Both are in .gitignore, but a `git add -f` would bypass that,
-    so this fails the build instead.
+    UPGRADE_PROMPT.md is a private spec, docs/UPGRADE_PROGRESS.md its phase log,
+    docs/TESTING.md the sandbox procedure, and check-teardown.sh runs against a
+    real AWS account. All are in .gitignore, but a `git add -f` would bypass
+    that, so this fails the build instead.
     """
     assert name not in tracked_files(), (
         f"{name} is tracked and would be pushed. Run: git rm --cached {name}"

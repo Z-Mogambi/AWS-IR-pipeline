@@ -345,9 +345,8 @@ deliberate: it is the number that reflects how long an attacker actually had.
 An internal-only figure would look better and mean less.
 
 There are no benchmark numbers in this README because none have been measured
-in a real account yet. [`docs/TESTING.md`](TESTING.md) is the procedure for
-producing them; the `<stack>-incident-response` dashboard shows them once there
-is data.
+in a real account yet. The `<stack>-incident-response` dashboard shows them
+once there is data; until then, quoting a figure would be inventing one.
 
 ---
 
@@ -396,9 +395,7 @@ tests/                            465 tests, none touching AWS
 evals/                            16 labelled triage fixtures, run by hand
 infra/github-oidc-role.yaml       deploy role, trust pinned to one branch
 docs/
-  UPGRADE_PROGRESS.md             decisions, conflicts, open VERIFY items
-  TESTING.md                      sandbox procedure
-  scp-protect-environment-tag.json
+  scp-protect-environment-tag.json  example SCP protecting the Environment tag
 ```
 
 ---

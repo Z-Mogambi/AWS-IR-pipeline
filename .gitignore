@@ -5,8 +5,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Local-only, deliberately never committed or pushed.
-# UPGRADE_PROMPT.md is the private upgrade spec; check-teardown.sh is an
+# Local-only working notes, deliberately never committed or pushed.
+# UPGRADE_PROMPT.md is the private upgrade spec, docs/UPGRADE_PROGRESS.md its
+# phase log, docs/TESTING.md the sandbox procedure, and check-teardown.sh an
 # operational sweep that runs against a real AWS account.
 UPGRADE_PROMPT.md
 check-teardown.sh
+docs/TESTING.md
+docs/UPGRADE_PROGRESS.md

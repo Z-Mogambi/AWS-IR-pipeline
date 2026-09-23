@@ -13,8 +13,6 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
-TESTING = ROOT / "docs" / "TESTING.md"
-PROGRESS = ROOT / "docs" / "UPGRADE_PROGRESS.md"
 SCP = ROOT / "docs" / "scp-protect-environment-tag.json"
 
 
@@ -23,7 +21,7 @@ def readme():
     return README.read_text()
 
 
-@pytest.mark.parametrize("path", [README, TESTING, PROGRESS, SCP], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [README, SCP], ids=lambda p: p.name)
 def test_the_document_exists_and_is_not_a_stub(path):
     assert path.exists(), f"{path.name} is missing"
     assert len(path.read_text()) > 500, f"{path.name} looks like a stub"
@@ -42,7 +40,7 @@ def test_the_readme_quotes_no_unmeasured_performance_numbers(readme):
     """The previous one claimed 'MTTR 1+ hours -> <45 seconds' and '99%+'.
 
     Nothing has been measured in a real account, so no figure belongs here yet.
-    docs/TESTING.md is the procedure for producing one.
+    Nothing has been measured in a real account, so no figure belongs here.
     """
     for claim in ("<45 second", "45 seconds", "98%", "99%", "1+ hours"):
         assert claim not in readme, f"unmeasured performance claim: {claim!r}"
@@ -87,8 +85,7 @@ def test_the_readme_documents_every_template_parameter(readme):
     parameters = re.findall(r"^  ([A-Z][A-Za-z0-9]+):$", section, re.MULTILINE)
     assert parameters, "no parameters found; the parse is wrong"
 
-    documented = readme + TESTING.read_text()
-    undocumented = [p for p in parameters if p not in documented]
+    undocumented = [p for p in parameters if p not in readme]
     assert not undocumented, f"parameters mentioned nowhere in the docs: {undocumented}"
 
 
@@ -125,44 +122,6 @@ def test_the_threat_model_covers_what_the_brief_asked_for(readme):
         assert topic.lower() in threat_model.lower(), f"threat model omits: {topic}"
 
 
-# --- the testing procedure --------------------------------------------------
-
-
-def test_the_stratus_technique_id_is_the_verified_one():
-    """Verified against stratus-red-team.cloud, not guessed."""
-    assert "aws.credential-access.ec2-steal-instance-credentials" in TESTING.read_text()
-
-
-def test_the_guardduty_tester_is_attributed_to_the_right_org():
-    """It is awslabs, not aws-samples."""
-    text = TESTING.read_text()
-    assert "awslabs/amazon-guardduty-tester" in text
-    assert "aws-samples/amazon-guardduty-tester" not in text
-
-
-def test_the_testing_doc_covers_the_three_required_procedures():
-    text = TESTING.read_text().lower()
-    assert "stratus" in text
-    assert "sample" in text and "create-sample-findings" in TESTING.read_text()
-    assert "reverse shell" in text
-
-
-def test_the_reverse_shell_test_explains_what_proves_it_worked():
-    """The point is the shell dying on seal, not on attach."""
-    text = TESTING.read_text()
-    assert "quarantine-sg-seal" in text
-    assert "negative control" in text.lower(), (
-        "the procedure should include the control that shows the mechanism matters"
-    )
-
-
-def test_the_testing_doc_warns_about_sandbox_and_cost():
-    text = TESTING.read_text()
-    assert "sandbox" in text.lower()
-    assert "## Cost" in text
-    assert "Object Lock" in text, "retention prevents deleting the evidence bucket"
-
-
 # --- internal links ---------------------------------------------------------
 
 
@@ -174,10 +133,13 @@ def test_relative_links_in_the_readme_resolve(readme):
         )
 
 
-def test_relative_links_in_the_docs_resolve():
-    for document in (TESTING,):
-        for target in re.findall(r"\]\((?!https?:)([^)#]+)\)", document.read_text()):
-            candidates = [document.parent / target, ROOT / target]
-            assert any(path.exists() for path in candidates), (
-                f"{document.name} links to {target}, which does not exist"
-            )
+def test_no_link_points_at_an_untracked_document():
+    """Two working notes are deliberately local-only and gitignored.
+
+    A link to either would be dead for anyone who clones the repository.
+    """
+    readme_text = README.read_text()
+    for absent in ("TESTING.md", "UPGRADE_PROGRESS.md", "multi-account.md"):
+        assert absent not in readme_text, (
+            f"the README links to {absent}, which is not in the repository"
+        )
