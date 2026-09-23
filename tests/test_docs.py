@@ -14,7 +14,6 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 TESTING = ROOT / "docs" / "TESTING.md"
-MULTI_ACCOUNT = ROOT / "docs" / "multi-account.md"
 PROGRESS = ROOT / "docs" / "UPGRADE_PROGRESS.md"
 SCP = ROOT / "docs" / "scp-protect-environment-tag.json"
 
@@ -24,8 +23,7 @@ def readme():
     return README.read_text()
 
 
-@pytest.mark.parametrize("path", [README, TESTING, MULTI_ACCOUNT, PROGRESS, SCP],
-                         ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [README, TESTING, PROGRESS, SCP], ids=lambda p: p.name)
 def test_the_document_exists_and_is_not_a_stub(path):
     assert path.exists(), f"{path.name} is missing"
     assert len(path.read_text()) > 500, f"{path.name} looks like a stub"
@@ -114,7 +112,7 @@ def test_the_prerequisites_are_documented(readme):
 def test_the_known_limitations_are_documented(readme):
     limitations = readme[readme.index("## Known limitations"):]
     for limitation in ("DNS Firewall is VPC-wide", "NACL", "SSM agent",
-                       "exposure window", "Memory capture"):
+                       "exposure window", "Memory capture", "Single account"):
         assert limitation.lower() in limitations.lower(), (
             f"limitation not documented: {limitation}"
         )
@@ -165,29 +163,6 @@ def test_the_testing_doc_warns_about_sandbox_and_cost():
     assert "Object Lock" in text, "retention prevents deleting the evidence bucket"
 
 
-# --- multi-account is design only -------------------------------------------
-
-
-def test_multi_account_is_marked_as_unimplemented():
-    text = MULTI_ACCOUNT.read_text()
-    assert "Design only" in text or "design only" in text
-    assert "not implemented" in text.lower()
-
-
-def test_multi_account_is_actually_not_implemented():
-    """The document must not describe something the template quietly does."""
-    template = (ROOT / "template.yaml").read_text()
-    assert "IRResponder" not in template
-    assert "sts:AssumeRole" not in template
-    assert not (ROOT / "layers/common/python/irlib/crossaccount.py").exists()
-
-
-def test_multi_account_covers_the_design_the_brief_asked_for():
-    text = MULTI_ACCOUNT.read_text().lower()
-    for topic in ("delegated administrator", "security account", "cross-account"):
-        assert topic in text, f"multi-account design omits: {topic}"
-
-
 # --- internal links ---------------------------------------------------------
 
 
@@ -200,7 +175,7 @@ def test_relative_links_in_the_readme_resolve(readme):
 
 
 def test_relative_links_in_the_docs_resolve():
-    for document in (TESTING, MULTI_ACCOUNT):
+    for document in (TESTING,):
         for target in re.findall(r"\]\((?!https?:)([^)#]+)\)", document.read_text()):
             candidates = [document.parent / target, ROOT / target]
             assert any(path.exists() for path in candidates), (

@@ -320,7 +320,10 @@ Enable these yourself:
   step.
 - **Memory capture is a stub.** It reports `implemented: false` rather than
   silently implying success.
-- **Multi-account is design-only.** See [`docs/multi-account.md`](multi-account.md).
+- **Single account only.** The pipeline responds to findings in the account it
+  is deployed into. Running it from a security account against workload
+  accounts would need a responder role per account and a role assumption on
+  every call, which is not implemented.
 
 ---
 
@@ -395,7 +398,6 @@ infra/github-oidc-role.yaml       deploy role, trust pinned to one branch
 docs/
   UPGRADE_PROGRESS.md             decisions, conflicts, open VERIFY items
   TESTING.md                      sandbox procedure
-  multi-account.md                design only
   scp-protect-environment-tag.json
 ```
 
