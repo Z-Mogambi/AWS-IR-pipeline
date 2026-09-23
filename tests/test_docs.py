@@ -133,13 +133,20 @@ def test_relative_links_in_the_readme_resolve(readme):
         )
 
 
-def test_no_link_points_at_an_untracked_document():
-    """Two working notes are deliberately local-only and gitignored.
+def test_the_readme_never_links_to_something_not_in_the_repository():
+    """docs/ holds private working notes that are not committed.
 
-    A link to either would be dead for anyone who clones the repository.
+    A link to one of them would be dead for anyone who clones the repository,
+    so every relative link must resolve against tracked files only.
     """
-    readme_text = README.read_text()
-    for absent in ("TESTING.md", "UPGRADE_PROGRESS.md", "multi-account.md"):
-        assert absent not in readme_text, (
-            f"the README links to {absent}, which is not in the repository"
+    import subprocess
+
+    tracked = set(
+        subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
+                       text=True, check=True).stdout.split()
+    )
+    for target in re.findall(r"\]\((?!https?:)([^)#]+)\)", README.read_text()):
+        candidates = {target, f"docs/{target}"}
+        assert candidates & tracked, (
+            f"the README links to {target}, which is not a tracked file"
         )

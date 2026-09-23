@@ -120,12 +120,10 @@ def test_dev_requirements_are_not_installed_into_a_function():
 
 # --- files that must stay local ---------------------------------------------
 
-LOCAL_ONLY = (
-    "UPGRADE_PROMPT.md",
-    "check-teardown.sh",
-    "docs/TESTING.md",
-    "docs/UPGRADE_PROGRESS.md",
-)
+LOCAL_ONLY = ("UPGRADE_PROMPT.md", "check-teardown.sh")
+
+# Everything under docs/ is a private working note except the example SCP.
+TRACKED_UNDER_DOCS = {"docs/scp-protect-environment-tag.json"}
 
 
 def tracked_files():
@@ -141,20 +139,29 @@ def tracked_files():
 def test_local_only_files_are_never_tracked(name):
     """These must not reach the remote.
 
-    UPGRADE_PROMPT.md is a private spec, docs/UPGRADE_PROGRESS.md its phase log,
-    docs/TESTING.md the sandbox procedure, and check-teardown.sh runs against a
-    real AWS account. All are in .gitignore, but a `git add -f` would bypass
-    that, so this fails the build instead.
+    One is a private spec, the other runs against a real AWS account. Both are
+    in .gitignore, but a `git add -f` would bypass that, so this fails the
+    build instead.
     """
     assert name not in tracked_files(), (
         f"{name} is tracked and would be pushed. Run: git rm --cached {name}"
     )
 
 
-@pytest.mark.parametrize("name", LOCAL_ONLY)
-def test_local_only_files_are_gitignored(name):
-    """Belt and braces: the ignore rule is what stops a blanket `git add -A`."""
-    ignored = (ROOT / ".gitignore").read_text().splitlines()
-    assert name in [line.strip() for line in ignored], (
-        f"{name} is missing from .gitignore"
+def test_only_the_example_policy_is_tracked_under_docs():
+    """docs/ is working notes. Nothing there should reach the remote except the
+    example SCP, which the README links to."""
+    under_docs = {path for path in tracked_files() if path.startswith("docs/")}
+    unexpected = under_docs - TRACKED_UNDER_DOCS
+    assert not unexpected, (
+        f"private notes are tracked under docs/: {sorted(unexpected)}. "
+        "Run: git rm --cached <path>"
     )
+
+
+def test_the_ignore_rules_still_cover_the_local_only_files():
+    """Belt and braces: the ignore rules are what stop a blanket `git add -A`."""
+    rules = [line.strip() for line in (ROOT / ".gitignore").read_text().splitlines()]
+    for name in LOCAL_ONLY:
+        assert name in rules, f"{name} is missing from .gitignore"
+    assert "docs/*.md" in rules, "docs/ notes are not covered by an ignore rule"
