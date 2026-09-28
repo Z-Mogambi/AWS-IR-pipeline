@@ -105,14 +105,22 @@ def test_every_state_terminates_or_transitions(path):
 
 @pytest.mark.parametrize("path", ASL_FILES, ids=lambda p: p.name)
 def test_substitutions_are_supplied_by_the_template(path):
-    """Every ${Name} in the ASL must appear in DefinitionSubstitutions."""
-    raw = path.read_text()
-    used = set(re.findall(r"\$\{([A-Za-z0-9_]+)\}", raw))
-    template = (ROOT / "template.yaml").read_text()
-    # Substitutions are supplied with !GetAtt for ARNs and !Ref for plain values.
-    supplied = set(
-        re.findall(r"^\s{8}([A-Za-z0-9_]+):\s*!(?:GetAtt|Ref)\b", template, re.MULTILINE)
-    )
+    """Every ${Name} in the ASL must appear in DefinitionSubstitutions.
+
+    Parses the template rather than matching on the value's form: a
+    substitution may be a !GetAtt, a !Ref or an !If, and a regex that assumed
+    one of those silently stopped checking when the form changed.
+    """
+    yaml_helper = pytest.importorskip("samtranslator.yaml_helper")
+    template = yaml_helper.yaml_parse((ROOT / "template.yaml").read_text())
+
+    used = set(re.findall(r"\$\{([A-Za-z0-9_]+)\}", path.read_text()))
+    supplied = set()
+    for body in template["Resources"].values():
+        if body["Type"] != "AWS::Serverless::StateMachine":
+            continue
+        supplied |= set(body["Properties"].get("DefinitionSubstitutions", {}))
+
     missing = used - supplied
     assert not missing, f"{path.name} uses substitutions the template does not define: {missing}"
 

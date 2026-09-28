@@ -526,3 +526,81 @@ def test_investigation_is_off_by_default(transformed):
 def test_triage_temperature_defaults_to_zero(transformed):
     """The same finding should produce the same summary; it is read as evidence."""
     assert transformed["Parameters"]["TriageTemperature"]["Default"] == "0"
+
+
+# --- deploy-time validity ----------------------------------------------------
+
+
+def test_no_state_machine_substitution_can_render_empty(transformed):
+    """Step Functions validates the definition at CreateStateMachine.
+
+    A substitution sourced straight from a parameter with an empty default
+    would produce an invalid definition and fail the whole stack - even for a
+    state that is never reached at runtime.
+    """
+    import re
+
+    template = yaml_parse((ROOT / "template.yaml").read_text())
+    empty_by_default = {
+        name for name, spec in template["Parameters"].items()
+        if spec.get("Default") == ""
+    }
+
+    machines = resources_of(transformed, "AWS::StepFunctions::StateMachine")
+    for name, body in machines.items():
+        substitutions = body["Properties"].get("DefinitionSubstitutions", {})
+        for key, value in substitutions.items():
+            rendered = json.dumps(value)
+            for parameter in empty_by_default:
+                if f'"Ref": "{parameter}"' in rendered:
+                    assert "Fn::If" in rendered, (
+                        f"{name}: substitution {key} comes straight from {parameter}, "
+                        "whose default is empty. Guard it with Fn::If."
+                    )
+
+
+def test_every_asl_substitution_is_supplied(transformed):
+    """A missing substitution leaves a literal ${Name} in the deployed definition."""
+    import re
+
+    machines = resources_of(transformed, "AWS::StepFunctions::StateMachine")
+    for name, body in machines.items():
+        definition = json.dumps(body["Properties"])
+        leftover = set(re.findall(r"\$\{([A-Za-z0-9_]+)\}", definition))
+        # AWS pseudo-parameters are resolved by CloudFormation, not by us.
+        leftover -= {"AWS", "AWS::Region", "AWS::AccountId", "AWS::Partition", "AWS::StackName"}
+        assert not leftover, f"{name} has unresolved substitutions: {sorted(leftover)}"
+
+
+def test_no_iam_role_has_an_explicit_name(transformed):
+    """Named roles would require CAPABILITY_NAMED_IAM; samconfig declares only
+    CAPABILITY_IAM, so the deploy would be rejected."""
+    roles = resources_of(transformed, "AWS::IAM::Role")
+    named = [n for n, b in roles.items() if "RoleName" in b["Properties"]]
+    assert not named, f"these roles need CAPABILITY_NAMED_IAM: {named}"
+
+
+def test_object_lock_has_the_versioning_it_requires(transformed):
+    bucket = transformed["Resources"]["EvidenceBucket"]["Properties"]
+    assert bucket["VersioningConfiguration"]["Status"] == "Enabled"
+    retention = bucket["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]
+    assert ("Days" in retention) != ("Years" in retention), (
+        "DefaultRetention takes exactly one of Days or Years"
+    )
+
+
+def test_the_prompt_attack_filter_sets_output_strength_none(transformed):
+    """PROMPT_ATTACK only filters input; any other OutputStrength is rejected."""
+    filters = transformed["Resources"]["TriageGuardrail"]["Properties"][
+        "ContentPolicyConfig"
+    ]["FiltersConfig"]
+    prompt_attack = [f for f in filters if f["Type"] == "PROMPT_ATTACK"][0]
+    assert prompt_attack["OutputStrength"] == "NONE"
+
+
+def test_table_attribute_definitions_match_the_key_schema(transformed):
+    """DynamoDB rejects an AttributeDefinition that is not part of a key."""
+    table = transformed["Resources"]["IncidentsTable"]["Properties"]
+    assert {k["AttributeName"] for k in table["KeySchema"]} == {
+        a["AttributeName"] for a in table["AttributeDefinitions"]
+    }

@@ -732,7 +732,15 @@ Resources:
         ImdsFunctionArn: !GetAtt ImdsFunction.Arn
         AiEnrichFunctionArn: !GetAtt AiEnrichFunction.Arn
         TriageValidateFunctionArn: !GetAtt TriageValidateFunction.Arn
-        BedrockModelId: !Ref BedrockModelId
+        # Step Functions validates the definition at CreateStateMachine, and the
+        # optimised Bedrock integration rejects an empty ModelId - so an empty
+        # parameter would fail the whole stack even though the Triage state is
+        # never reached when triage is off. A placeholder keeps the definition
+        # valid without inventing a real model id.
+        BedrockModelId: !If
+          - HasAiTriage
+          - !Ref BedrockModelId
+          - ai-triage-disabled
         InvestigateFunctionArn: !GetAtt InvestigateFunction.Arn
         AlertFunctionArn: !GetAtt AlertFunction.Arn
       Policies:
