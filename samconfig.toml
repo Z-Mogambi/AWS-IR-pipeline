@@ -1,5 +1,16 @@
 version = 0.1
 
+# The AWS profile every sam command uses. Pinned because this machine's
+# `default` profile points at a different, abandoned account - so a bare
+# `sam deploy` would otherwise build the whole stack in the wrong place.
+#
+# A profile name is a local alias, not a credential: it resolves against
+# whoever's ~/.aws/credentials is running the command. Change it to your own
+# when you fork, or drop the line and pass --profile yourself.
+#
+# Note this covers sam only. The aws CLI ignores this file, so commands in the
+# testing procedure still need --profile, or AWS_PROFILE set in the shell.
+
 [default.deploy.parameters]
 stack_name = "ir-pipeline-prod"
 resolve_s3 = true
@@ -11,3 +22,4 @@ image_repositories = []
 
 [default.global.parameters]
 region = "us-east-1"
+profile = "ir-pipline"
