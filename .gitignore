@@ -10,4 +10,6 @@ __pycache__/
 # check-teardown.sh runs against a real AWS account.
 UPGRADE_PROMPT.md
 check-teardown.sh
+.envrc
+.direnv/
 docs/*.md

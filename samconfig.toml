@@ -22,4 +22,4 @@ image_repositories = []
 
 [default.global.parameters]
 region = "us-east-1"
-profile = "ir-pipline"
+profile = "ir-pipeline"
