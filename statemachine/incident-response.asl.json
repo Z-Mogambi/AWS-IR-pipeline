@@ -10,6 +10,15 @@
       "TimeoutSeconds": 60,
       "Retry": [
         {
+          "Comment": "GuardDuty publishes a finding to EventBridge before its own store is readable. Observed live: GetFindings returned nothing ~3s after the event, and the same id resolved moments later. Retrying covers the window; a genuinely absent finding still falls through to the Catch below.",
+          "ErrorEquals": [
+            "FindingNotFound"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        },
+        {
           "ErrorEquals": [
             "Lambda.ServiceException",
             "Lambda.AWSLambdaException",

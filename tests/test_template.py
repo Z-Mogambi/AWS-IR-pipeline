@@ -149,6 +149,8 @@ def test_wildcard_resources_only_where_the_action_requires_it(transformed, logic
         # reference, so "*" is the narrowest they can be written.
         "cloudtrail:LookupEvents",
         "inspector2:ListFindings",
+        # A list operation with no resource in its authorisation context.
+        "route53resolver:ListFirewallRuleGroupAssociations",
     }
     for statement in statements_for(transformed, logical_id):
         resource = statement.get("Resource")
@@ -604,3 +606,24 @@ def test_table_attribute_definitions_match_the_key_schema(transformed):
     assert {k["AttributeName"] for k in table["KeySchema"]} == {
         a["AttributeName"] for a in table["AttributeDefinitions"]
     }
+
+
+def test_snapshot_permissions_include_the_ownerless_arn(transformed):
+    """A snapshot has no owner at the moment it is created.
+
+    EC2 authorises CreateSnapshots against an ARN with an empty account field,
+    so an account-scoped ARN alone never matches. Observed live: the call was
+    denied with "on resource: arn:aws:ec2:us-east-1::snapshot/*". This looks
+    like a mistake and is not one.
+    """
+    for statement in statements_for(transformed, "EvidenceFunction"):
+        actions = actions_of(statement)
+        if "ec2:CreateSnapshots" not in actions and "ec2:CreateTags" not in actions:
+            continue
+        rendered = json.dumps(statement["Resource"])
+        if "snapshot" not in rendered:
+            continue
+        assert '::snapshot/*' in rendered.replace("${AWS::Region}", "R"), (
+            "snapshot permissions must include the ownerless ARN form, or "
+            "CreateSnapshots is denied"
+        )

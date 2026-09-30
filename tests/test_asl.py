@@ -355,3 +355,30 @@ def test_one_failed_instance_does_not_end_silently():
     """The Map catches so a partial containment still notifies."""
     contain = load(ASL_DIR / "incident-response.asl.json")["States"]["ContainInstances"]
     assert contain["Catch"][0]["Next"] == "NotifyContainmentFailed"
+
+
+def test_verification_retries_a_finding_that_is_not_readable_yet():
+    """GuardDuty publishes to EventBridge before GetFindings is consistent.
+
+    Observed on a live account: GetFindings returned nothing about three
+    seconds after the event, and the same finding id resolved a minute later.
+    Without a retry the trust boundary rejects legitimate findings.
+    """
+    verify = load(ASL_DIR / "incident-response.asl.json")["States"]["VerifyFinding"]
+    retries = [r for r in verify["Retry"] if "FindingNotFound" in r["ErrorEquals"]]
+    assert retries, "VerifyFinding must retry FindingNotFound"
+
+    retry = retries[0]
+    coverage = sum(
+        retry["IntervalSeconds"] * retry["BackoffRate"] ** n
+        for n in range(retry["MaxAttempts"])
+    )
+    assert coverage >= 60, f"only {coverage}s of retry coverage; the race can exceed that"
+
+
+def test_an_archived_finding_is_never_retried():
+    """Archived is a terminal state, not a transient one. Retrying it would
+    delay a legitimate rejection for no reason."""
+    verify = load(ASL_DIR / "incident-response.asl.json")["States"]["VerifyFinding"]
+    for retry in verify["Retry"]:
+        assert "FindingArchived" not in retry["ErrorEquals"]

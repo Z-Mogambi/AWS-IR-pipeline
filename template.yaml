@@ -389,12 +389,21 @@ Resources:
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                # A snapshot has no owner at the moment it is created, so EC2
+                # authorises CreateSnapshots against the ownerless ARN form -
+                # with an empty account field. Observed live: the account-scoped
+                # ARN above never matches and the call is denied. This does not
+                # widen access to other accounts' snapshots, which carry their
+                # owner's id.
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
             - Effect: Allow
               # Tagging the snapshots CreateSnapshots produces, and labelling
-              # the instance so it is obvious in the console.
+              # the instance so it is obvious in the console. The snapshot is
+              # tagged during creation, so the ownerless form is needed here too.
               Action: ec2:CreateTags
               Resource:
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
                 - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
         - Statement:
             - Effect: Allow
@@ -415,8 +424,13 @@ Resources:
               # Best effort. Requires Malware Protection to be enabled on the
               # detector beforehand - the service-linked role is deliberately
               # not created here, so this function needs no IAM write access.
+              # Takes the EC2 instance ARN as its ResourceArn, so it authorises
+              # against the instance rather than the detector. Observed live:
+              # the detector-scoped ARN alone was denied.
               Action: guardduty:StartMalwareScan
-              Resource: !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
         - Statement:
             - Effect: Allow
               Action:
@@ -475,10 +489,13 @@ Resources:
               Action: route53resolver:UpdateFirewallDomains
               Resource: !Sub "arn:${AWS::Partition}:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-domain-list/*"
             - Effect: Allow
-              Action:
-                - route53resolver:AssociateFirewallRuleGroup
-                - route53resolver:ListFirewallRuleGroupAssociations
+              Action: route53resolver:AssociateFirewallRuleGroup
               Resource: !Sub "arn:${AWS::Partition}:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-rule-group/*"
+            - Effect: Allow
+              # A list operation with no resource in its authorisation context.
+              # Observed live: the rule-group-scoped ARN was denied.
+              Action: route53resolver:ListFirewallRuleGroupAssociations
+              Resource: "*"
         - Statement:
             - Effect: Allow
               Action:
