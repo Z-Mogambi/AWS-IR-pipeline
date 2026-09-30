@@ -13,7 +13,6 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
-SCP = ROOT / "docs" / "scp-protect-environment-tag.json"
 
 
 @pytest.fixture(scope="module")
@@ -21,10 +20,9 @@ def readme():
     return README.read_text()
 
 
-@pytest.mark.parametrize("path", [README, SCP], ids=lambda p: p.name)
-def test_the_document_exists_and_is_not_a_stub(path):
-    assert path.exists(), f"{path.name} is missing"
-    assert len(path.read_text()) > 500, f"{path.name} looks like a stub"
+def test_the_readme_exists_and_is_not_a_stub():
+    assert README.exists()
+    assert len(README.read_text()) > 500, "the README looks like a stub"
 
 
 # --- claims this project previously got wrong -------------------------------
@@ -134,7 +132,7 @@ def test_relative_links_in_the_readme_resolve(readme):
 
 
 def test_the_readme_never_links_to_something_not_in_the_repository():
-    """docs/ holds private working notes that are not committed.
+    """Nothing under docs/ is committed - it is all local working notes.
 
     A link to one of them would be dead for anyone who clones the repository,
     so every relative link must resolve against tracked files only.

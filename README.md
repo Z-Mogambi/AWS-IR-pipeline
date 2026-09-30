@@ -239,9 +239,11 @@ rules, but it does not close this on its own.
 
 What does: the allowlist contains in every environment regardless of tags; the
 `AccountEnvironmentMap` parameter overrides tags entirely, and an account is far
-harder to change; and
-[`docs/scp-protect-environment-tag.json`](scp-protect-environment-tag.json)
-denies changes to the `Environment` tag except by a named role.
+harder to change than a tag; and a service control policy denying
+`ec2:CreateTags` and `ec2:DeleteTags` on the `Environment` key, except by one
+named role, closes the rest. That SCP belongs in your organisation's guardrails
+rather than in this repository, since it governs accounts this stack does not
+own.
 
 ### Approval spoofing
 
@@ -394,8 +396,6 @@ src/                              one directory per function
 tests/                            465 tests, none touching AWS
 evals/                            16 labelled triage fixtures, run by hand
 infra/github-oidc-role.yaml       deploy role, trust pinned to one branch
-docs/
-  scp-protect-environment-tag.json  example SCP protecting the Environment tag
 ```
 
 ---

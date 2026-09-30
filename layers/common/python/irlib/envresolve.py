@@ -9,8 +9,9 @@ Two sources, in priority order:
 A missing tag, an unreadable tag, or a value nobody recognises resolves to
 production. That is the deliberate direction to fail in: treating a production
 box as a dev box means skipping containment on the resource that matters most,
-whereas the reverse only costs an approval prompt. docs/scp-protect-environment-tag.json
-shows how to stop anyone but a named role from touching the tag at all.
+whereas the reverse only costs an approval prompt. An SCP denying changes to
+the Environment tag key, except by one named role, stops the tag being a way to
+influence this decision at all.
 """
 
 import logging

@@ -122,8 +122,9 @@ def test_dev_requirements_are_not_installed_into_a_function():
 
 LOCAL_ONLY = ("UPGRADE_PROMPT.md", "check-teardown.sh")
 
-# Everything under docs/ is a private working note except the example SCP.
-TRACKED_UNDER_DOCS = {"docs/scp-protect-environment-tag.json"}
+# Nothing under docs/ is needed to build, test or deploy. It is all local
+# working notes, so none of it belongs in the repository.
+TRACKED_UNDER_DOCS = set()
 
 
 def tracked_files():
@@ -148,13 +149,13 @@ def test_local_only_files_are_never_tracked(name):
     )
 
 
-def test_only_the_example_policy_is_tracked_under_docs():
-    """docs/ is working notes. Nothing there should reach the remote except the
-    example SCP, which the README links to."""
+def test_nothing_under_docs_is_tracked():
+    """docs/ is local working notes. None of it is needed to run the pipeline,
+    and none of it should reach the remote."""
     under_docs = {path for path in tracked_files() if path.startswith("docs/")}
     unexpected = under_docs - TRACKED_UNDER_DOCS
     assert not unexpected, (
-        f"private notes are tracked under docs/: {sorted(unexpected)}. "
+        f"working notes are tracked under docs/: {sorted(unexpected)}. "
         "Run: git rm --cached <path>"
     )
 
@@ -164,4 +165,4 @@ def test_the_ignore_rules_still_cover_the_local_only_files():
     rules = [line.strip() for line in (ROOT / ".gitignore").read_text().splitlines()]
     for name in LOCAL_ONLY:
         assert name in rules, f"{name} is missing from .gitignore"
-    assert "docs/*.md" in rules, "docs/ notes are not covered by an ignore rule"
+    assert "docs/" in rules, "docs/ is not covered by an ignore rule"

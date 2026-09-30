@@ -6,10 +6,10 @@ __pycache__/
 .pytest_cache/
 
 # Local-only working notes, deliberately never committed or pushed.
-# docs/ holds private notes; the only thing tracked there is the example SCP.
+# Nothing under docs/ is needed to build, test or deploy the pipeline.
 # check-teardown.sh runs against a real AWS account.
 UPGRADE_PROMPT.md
 check-teardown.sh
 .envrc
 .direnv/
-docs/*.md
+docs/
